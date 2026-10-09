@@ -15,6 +15,7 @@ import vllm_gaudi.extension.ops as hpu_ops
 from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8PerChannel, VllmMixtureOfExpertsOpFP8)
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.ops.hpu_fused_moe import (_normalize_moe_activation, model_has_quant_config, select_experts_from_routed)
+from vllm_gaudi.ops.hpu_moe_combine import gather_silu_fp8_moe
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
 from vllm.model_executor.kernels.linear import _POSSIBLE_FP8_BLOCK_KERNELS, _POSSIBLE_FP8_KERNELS
@@ -49,11 +50,6 @@ _HPU_MOE_GATHER_VERIFY_REL_ERR = 0.05
 # of them); it loses once g approaches local_experts (the dense gather + fp32 bmm
 # path is slower than the Habana op). See envs.py for the default rationale.
 _HPU_MOE_GATHER_RATIO = envs.VLLM_HPU_MOE_GATHER_RATIO
-if _HPU_MOE_GATHER:
-    from vllm_gaudi.ops.hpu_moe_combine import gather_silu_fp8_moe  # noqa: E402
-else:
-    gather_silu_fp8_moe = None  # type: ignore[assignment]
-
 if _HPU_MOE_GATHER_VERIFY:
     logger.info("MoE gather combine VERIFY mode enabled: comparing custom vs stock "
                 "per layer (FP8-ULP bar = %d)", _HPU_MOE_GATHER_VERIFY_MAX_ULP)
@@ -375,6 +371,10 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
         activation = _normalize_moe_activation(layer.activation)
+        limit = getattr(layer, "swiglu_limit", None)
+        if limit is not None and (activation != "silu" or not self._moe_gather_ok
+                                  or self.quant_config.activation_scheme == "static"):
+            raise NotImplementedError("Clamped HPU FP8 MoE requires dynamic per-channel silu weights")
         # Use the custom gathered-expert combine only when it wins: the number of
         # distinct routed experts g = min(local_experts, tokens*K) must stay below
         # a fraction of this rank's local_experts. Beyond that (large batch / long
@@ -384,17 +384,17 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         use_gather = (_HPU_MOE_GATHER and activation == "silu" and self.quant_config.activation_scheme != "static"
                       and self._moe_gather_ok
                       and x.shape[0] * topk_ids.shape[-1] <= layer.local_num_experts * _HPU_MOE_GATHER_RATIO)
-        if use_gather:
+        if use_gather or limit is not None:
             # EXPERIMENTAL custom combine: gather only the routed experts
             # (bypasses the Habana op's fixed per-layer stage pipeline).
-            if _HPU_MOE_GATHER_VERIFY:
+            if _HPU_MOE_GATHER_VERIFY and limit is None:
                 stock = layer.moe_op(x, topk_ids, topk_weights, permuted_weights=True, activation=activation)
                 custom = gather_silu_fp8_moe(layer, x, topk_ids, topk_weights)
                 _verify_moe_combine(stock, custom)
                 del stock
                 output = custom
             else:
-                output = gather_silu_fp8_moe(layer, x, topk_ids, topk_weights)
+                output = gather_silu_fp8_moe(layer, x, topk_ids, topk_weights, swiglu_limit=limit)
         else:
             output = layer.moe_op(
                 x,
