@@ -35,3 +35,15 @@ def test_prefill_decode_matches_sequential_recurrence():
         actual = torch.cat([out, last], dim=1).cpu().float()
         torch.testing.assert_close(actual, expected.bfloat16().float(), atol=2e-4, rtol=.01)
         torch.testing.assert_close(actual_state.cpu(), expected_state.float(), atol=1e-4, rtol=.001)
+
+
+def test_single_token_initialization_without_returned_state():
+    generator = torch.Generator().manual_seed(71)
+    shape = (1, 1, 16, 128)
+    q, k, v = [torch.randn(shape, generator=generator).bfloat16() for _ in range(3)]
+    gate = -torch.rand(shape, generator=generator) * 5
+    beta = torch.rand(shape[:-1], generator=generator)
+    expected, _ = reference(q, k, v, gate, beta, torch.zeros(1, 16, 128, 128))
+    actual, state = hpu_chunk_kda(*[x.to('hpu') for x in (q, k, v, gate, beta)], output_final_state=False)
+    assert state is None
+    torch.testing.assert_close(actual.cpu().float(), expected.bfloat16().float(), atol=2e-4, rtol=.01)

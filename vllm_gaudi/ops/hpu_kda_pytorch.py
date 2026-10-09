@@ -178,6 +178,16 @@ def hpu_chunk_kda(
         k = k * inv
     q = q * (D**-0.5)
 
+    if T == 1:
+        # One decode token needs only the recurrence, not a triangular chunk solve.
+        state = initial_state if initial_state is not None else q.new_zeros(S, H, D, Vdim)
+        state = state.float() * g[:, 0].exp().unsqueeze(-1)
+        residual = v[:, 0] - (state * k[:, 0].unsqueeze(-1)).sum(-2)
+        update = residual * beta[:, 0].unsqueeze(-1)
+        state = state + k[:, 0].unsqueeze(-1) * update.unsqueeze(-2)
+        out = (state * q[:, 0].unsqueeze(-1)).sum(-2).unsqueeze(1).to(in_dtype)
+        return out, state if output_final_state else None
+
     # pad to chunk multiple (g padded with zeros: no decay in padding, so the
     # per-chunk cumsum stays constant after the last real token)
     if padded > T:

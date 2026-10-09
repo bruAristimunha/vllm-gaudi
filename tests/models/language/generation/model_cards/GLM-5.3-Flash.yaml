@@ -1,0 +1,35 @@
+# Manual serving smoke card, not an lm-eval accuracy baseline.
+model_name: zai-org/GLM-5.3-Flash
+revision: eb9eb208eb0d988989d07a6a12d0fdeb5f52574a
+status: experimental-text-only
+engine_args:
+  tensor_parallel_size: 4
+  dtype: bfloat16
+  enforce_eager: true
+  enable_prefix_caching: false
+  enable_expert_parallel: false
+  language_model_only: true
+  max_model_len: 4096
+  max_num_seqs: 1
+  max_num_batched_tokens: 256
+  num_gpu_blocks_override: 256
+  gpu_memory_utilization: 0.94
+environment:
+  PT_HPU_LAZY_MODE: "0"
+  VLLM_FLATTEN_INPUT: "true"
+  VLLM_CONTIGUOUS_PA: "0"
+  VLLM_KDA_SCAN: seq
+  VLLM_GDN_COMPUTE_FP32: "1"
+checks:
+  - prompt: "What is 17 multiplied by 19? Reply with only the number."
+    expected_content: "323"
+    expected_finish_reason: stop
+  - description: "Request lookup_temperature(city='Paris, France'), then provide temperature_c=22."
+    expected_tool: lookup_temperature
+    expected_result_contains: "22"
+  - description: "Put code 7319 before 310 repetitions of 'A quiet orchard has green leaves.', then ask for that code."
+    expected_content: "7319"
+limitations:
+  - "Smoke responses do not establish coding benchmark or broad model-quality parity."
+  - "The default HPU loader converts block FP8 to channel FP8."
+  - "Graphs, prefix caching, speculative decoding, expert parallelism and vision are unqualified."
