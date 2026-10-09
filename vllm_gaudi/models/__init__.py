@@ -2,6 +2,9 @@ from vllm.model_executor.models.registry import ModelRegistry
 
 
 def register_model():
+    ModelRegistry.register_model("Glm5NextForConditionalGeneration",
+                                 "vllm_gaudi.models.glm5_next:Glm5NextForConditionalGeneration")
+    ModelRegistry.register_model("Glm5NextForCausalLM", "vllm_gaudi.models.glm5_next:Glm5NextForCausalLM")
     from vllm_gaudi.models.gemma3_mm import HpuGemma3ForConditionalGeneration  # noqa: F401
     ModelRegistry.register_model(
         "Gemma3ForConditionalGeneration",  # Original architecture identifier in vLLM

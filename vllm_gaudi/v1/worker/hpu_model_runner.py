@@ -789,6 +789,14 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
     if isinstance(model, HpuModelAdapter):
         model = model.model
 
+    if any(arch.startswith('Glm5Next') for arch in getattr(model.config, 'architectures', [])):
+        modules = {module.prefix: module for module in model.modules() if isinstance(module, MambaBase)}
+        for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                if layer_name in modules:
+                    modules[layer_name].cache_group_idx = group_idx
+        return
+
     mamba_like_arch = [
         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
         "Qwen3NextForCausalLM", "NemotronHForCausalLM"
@@ -6814,7 +6822,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             attn_kernel_block_size, blocks_per_kv_block, num_kernel_blocks, kv_cache_shape)
                         # here attn does not share kv cache tensor, so we create separate tensors
                         kc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
-                        vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
+                        vc = (None if isinstance(kv_cache_spec, MLAAttentionSpec) else
+                              torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device))
                         kv_caches[layer_name] = (kc, vc, None, None)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
