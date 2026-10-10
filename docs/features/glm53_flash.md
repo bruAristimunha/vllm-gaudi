@@ -6,6 +6,10 @@ The adapter currently requires eager execution and no speculative decoding or ex
 
 Raw keys and gates occupy a padded BF16 cache with the same page geometry as the latent cache. Pooling and exact E4M3FN-value quantization run on HPU during selection; model values stay on HPU, while scheduling metadata is read on the host. This uses more cache memory and host synchronization than a compressed-cache implementation. It is a correctness baseline, not a tuned serving profile.
 
+Host scheduling tensors are copied once per forward context and reused across KDA and indexer layers. The cache expires with that context, including when the runner reuses a metadata object for a later request; cache-group selection still happens separately for each layer.
+
+Use `max_num_seqs=1` for the checked serving path. The batched/serial token-equality smoke test currently fails with two sequences, both before and after host-metadata reuse. Concurrent serving remains unqualified.
+
 The Hadamard/quantization helper intentionally breaks compilation: the tested HPU compiler removes required BF16 rounding in a FP32-to-BF16-to-FP32 round trip. Do not remove this boundary without exact quantization tests.
 
 The FP32 Sinkhorn loop inside mHC is compiled separately to reduce repeated host dispatch. Projection, mixing logits, and the BF16 output conversion remain eager: compiling the entire native mHC operation changes some BF16 outputs. Component tests require unchanged projection outputs and bound the FP32 combination-matrix error against both the native HPU path and CPU reference. This does not enable whole-model compilation or HPU Graphs.

@@ -13,6 +13,15 @@ from vllm_gaudi.ops.hpu_glm_mhc import hpu_mhc_pre
 from vllm_gaudi.ops.hpu_kda_pytorch import hpu_chunk_kda
 
 
+def _cpu_metadata(name):
+    context = get_forward_context()
+    # Scheduling values are shared by layers, but never by forward passes.
+    cache = context.additional_kwargs.setdefault("glm_cpu_metadata", {})
+    if name not in cache:
+        cache[name] = getattr(context.attn_metadata, name).cpu()
+    return cache[name]
+
+
 class HpuIndexerCache(DeepseekV32IndexerCache):
 
     def __init__(self, *, head_dim, dtype, prefix, cache_config, index_kpool):
@@ -53,11 +62,12 @@ class HpuIndexer(attention.Indexer):
         positions = positions.reshape(-1)
         # Only scheduling metadata crosses to the host; model values stay on HPU.
         if meta.is_prompt:
-            lengths = meta.seq_lens_tensor.cpu().tolist()
+            lengths = _cpu_metadata("seq_lens_tensor").tolist()
             batch = len(lengths)
             stride = slots.numel() // batch
-            contexts = meta.context_lens_tensor.cpu().tolist()
-            blocks = meta.block_list.reshape(batch, -1).cpu().tolist() if meta.block_list is not None else [[]] * batch
+            contexts = _cpu_metadata("context_lens_tensor").tolist()
+            blocks = _cpu_metadata("block_list").reshape(batch,
+                                                         -1).tolist() if meta.block_list is not None else [[]] * batch
             requests = []
             for row, length in enumerate(lengths):
                 prefix = [b * meta.block_size + j for b in blocks[row] for j in range(meta.block_size)][:contexts[row]]
@@ -65,9 +75,9 @@ class HpuIndexer(attention.Indexer):
                 prefix = torch.tensor(prefix, device=x.device, dtype=torch.long)
                 requests.append((row * stride, int(length), torch.cat([prefix, current])))
         else:
-            block_list = meta.block_list.cpu().tolist()
-            owners = meta.block_groups.cpu().tolist()
-            usage = meta.block_usage.cpu().round().long().tolist()
+            block_list = _cpu_metadata("block_list").tolist()
+            owners = _cpu_metadata("block_groups").tolist()
+            usage = _cpu_metadata("block_usage").round().long().tolist()
             requests = []
             for row in range(q.shape[0]):
                 physical = [
@@ -107,18 +117,18 @@ class HpuKda(kda.Glm5NextLinearAttention):
             self.A_log.float().exp() * decay.view(1, -1, self.local_num_heads, self.head_dim))
         beta = beta.float().sigmoid()
         conv, recurrent = self.kv_cache
-        load = meta.load_indices_tensor
-        store = meta.store_indices_tensor
+        load = _cpu_metadata("load_indices_tensor")
+        store = _cpu_metadata("store_indices_tensor")
         if load.ndim > 1:
             if self.cache_group_idx is None:
                 raise RuntimeError("KDA cache group was not bound")
             load = load[self.cache_group_idx]
             store = store[self.cache_group_idx]
-        load_ids, store_ids = load.cpu().tolist(), store.cpu().tolist()
+        load_ids, store_ids = load.tolist(), store.tolist()
         batch = len(load_ids)
         stride = x.shape[0] // batch
-        lengths = meta.seq_lens_tensor.cpu().tolist() if meta.is_prompt else [1] * batch
-        initial = meta.has_initial_states_p.cpu().tolist() if meta.is_prompt else [True] * batch
+        lengths = _cpu_metadata("seq_lens_tensor").tolist() if meta.is_prompt else [1] * batch
+        initial = _cpu_metadata("has_initial_states_p").tolist() if meta.is_prompt else [True] * batch
         conv_weights = torch.cat([m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
         core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         for row, (source, target, length, has_state) in enumerate(zip(load_ids, store_ids, lengths, initial)):

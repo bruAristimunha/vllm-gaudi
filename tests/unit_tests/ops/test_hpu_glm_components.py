@@ -3,13 +3,29 @@
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
 
 
 class GlmComponents(unittest.TestCase):
+
+    def test_host_metadata_reuses_transfers_only_within_one_forward(self):
+        from vllm_gaudi.models import glm5_next as glm
+
+        source = Mock()
+        source.cpu.side_effect = [torch.tensor([[2, 3], [5, 7]]), torch.tensor([[11, 13], [17, 19]])]
+        metadata = SimpleNamespace(load_indices_tensor=source)
+        first = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+        second = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+        with patch.object(glm, "get_forward_context", return_value=first):
+            self.assertEqual(glm._cpu_metadata("load_indices_tensor")[0].tolist(), [2, 3])
+            self.assertEqual(glm._cpu_metadata("load_indices_tensor")[1].tolist(), [5, 7])
+        self.assertEqual(source.cpu.call_count, 1)
+        with patch.object(glm, "get_forward_context", return_value=second):
+            self.assertEqual(glm._cpu_metadata("load_indices_tensor")[1].tolist(), [17, 19])
+        self.assertEqual(source.cpu.call_count, 2)
 
     def test_existing_sparse_indexer_preserves_request_ownership(self):
         from vllm_gaudi.ops import hpu_sparse_attn_indexer as indexer
