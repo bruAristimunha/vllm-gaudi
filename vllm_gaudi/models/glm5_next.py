@@ -171,8 +171,10 @@ class HpuDecoderLayer(model.Glm5NextDecoderLayer):
     def __init__(self, *args, vllm_config, **kwargs):
         if not vllm_config.model_config.enforce_eager:
             raise NotImplementedError("GLM HPU currently requires --enforce-eager")
-        if vllm_config.speculative_config is not None or vllm_config.cache_config.enable_prefix_caching:
-            raise NotImplementedError("GLM HPU prefix caching and speculative decoding are not qualified")
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError("GLM HPU speculative decoding is not qualified")
+        if vllm_config.cache_config.enable_prefix_caching and vllm_config.scheduler_config.max_num_seqs != 1:
+            raise NotImplementedError("GLM HPU prefix caching currently requires max_num_seqs=1")
         if vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError("GLM HPU currently supports tensor parallelism without expert parallelism")
         warmup = vllm_config.kernel_config.enable_jit_warmup

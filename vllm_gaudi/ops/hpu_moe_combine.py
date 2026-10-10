@@ -60,6 +60,18 @@ def gather_silu_fp8_moe(
             gather_silu_fp8_moe(layer, x[i:i + 8], topk_ids[i:i + 8], topk_weights[i:i + 8], swiglu_limit)
             for i in range(0, x.shape[0], 8)
         ])
+    # Quantization stays eager: compiling across its FP8 boundary changes values.
+    x_fp8, x_scale = _dynamic_quant(x)
+    compute = _compiled_gather if swiglu_limit is not None else _gather_from_quantized
+    return compute(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit)
+
+
+@torch.compile(backend="hpu_backend", fullgraph=True, dynamic=False)
+def _compiled_gather(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit):
+    return _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit)
+
+
+def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit):
     tokens, hidden_size = x.shape
     num_topk = topk_ids.shape[-1]
     w13 = layer.w13_weight  # [E, 2I, H] fp8
@@ -69,11 +81,9 @@ def gather_silu_fp8_moe(
     local_experts = w13.shape[0]
     intermediate_size = w13.shape[1] // 2
 
-    # ---- FP8-quantize x per token (match the op's input quantization) ----
     # x_scale is kept as [T,1] (NOT squeezed): fp8_gemm_v2 requires the row
     # scale in 2-D form; squeezing only works at T=1 and silently mis-scales at
     # larger T.
-    x_fp8, x_scale = _dynamic_quant(x)  # x_fp8 [T,H], x_scale [T,1] f32
 
     # ---- per-token expert combine weights (scatter over E) ----
     # topk_ids are GLOBAL expert ids; remap to this rank's local ids and mask

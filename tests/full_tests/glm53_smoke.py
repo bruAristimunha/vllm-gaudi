@@ -37,6 +37,7 @@ DummyModelLoader.load_weights = initialize_test_weights
 
 
 def main():
+    prefix_cache = os.environ.get('GLM_SMOKE_PREFIX_CACHE') == '1'
     source = os.environ.get('GLM_SMOKE_CONFIG')
     if source is None:
         from huggingface_hub import hf_hub_download
@@ -78,9 +79,9 @@ def main():
               load_format='dummy',
               dtype='bfloat16',
               enforce_eager=True,
-              enable_prefix_caching=False,
+              enable_prefix_caching=prefix_cache,
               max_model_len=768,
-              max_num_seqs=2,
+              max_num_seqs=1 if prefix_cache else 2,
               max_num_batched_tokens=int(sys.argv[1]) if len(sys.argv) > 1 else 256,
               gpu_memory_utilization=0.25,
               num_gpu_blocks_override=64,
@@ -91,6 +92,13 @@ def main():
     outputs = llm.generate(prompts, params)
     serial = [llm.generate([prompt], params)[0] for prompt in prompts]
     assert [o.outputs[0].token_ids for o in outputs] == [o.outputs[0].token_ids for o in serial]
+    if prefix_cache:
+        assert all(o.num_cached_tokens > 0 for o in serial), 'Prefix reuse was not exercised'
+        for cold, warm in zip(outputs, serial):
+            for token, expected, actual in zip(cold.outputs[0].token_ids, cold.outputs[0].logprobs,
+                                               warm.outputs[0].logprobs):
+                assert abs(expected[token].logprob - actual[token].logprob) <= 1e-4
+        print('PREFIX_CACHE_REUSE_PASS', [o.num_cached_tokens for o in serial], flush=True)
     import math
     for output in outputs:
         assert len(output.outputs[0].token_ids) == 6
