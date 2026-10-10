@@ -36,6 +36,7 @@ class HpuIndexer(attention.Indexer):
         context = get_current_vllm_config().compilation_config.static_forward_context
         context.pop(f"{self.prefix}.tail_cache", None)
         self.tail_cache = None
+        self._cached_pools = None
 
     @torch._dynamo.disable
     def forward(self, hidden_states, qr, positions, rotary_emb):
@@ -62,6 +63,7 @@ class HpuIndexer(attention.Indexer):
         positions = positions.reshape(-1)
         # Only scheduling metadata crosses to the host; model values stay on HPU.
         if meta.is_prompt:
+            self._cached_pools = None
             lengths = _cpu_metadata("seq_lens_tensor").tolist()
             batch = len(lengths)
             stride = slots.numel() // batch
@@ -74,17 +76,79 @@ class HpuIndexer(attention.Indexer):
                 current = slots[row * stride:row * stride + length]
                 prefix = torch.tensor(prefix, device=x.device, dtype=torch.long)
                 requests.append((row * stride, int(length), torch.cat([prefix, current])))
-        else:
-            block_list = _cpu_metadata("block_list").tolist()
-            owners = _cpu_metadata("block_groups").tolist()
-            usage = _cpu_metadata("block_usage").round().long().tolist()
-            requests = []
-            for row in range(q.shape[0]):
-                physical = [
-                    b * meta.block_size + j for b, owner, used in zip(block_list, owners, usage) if owner == row
-                    for j in range(used)
-                ]
-                requests.append((row, 1, torch.tensor(physical, device=x.device, dtype=torch.long)))
+            for start, length, physical in requests:
+                if length == 0 or physical.numel() == 0:
+                    continue
+                raw = cache.index_select(0, physical)
+                logical = select_pooled_tokens(q[start:start + length], weights[start:start + length], raw[:, :128],
+                                               raw[:, 128:256], self.index_kpool_compress_ape,
+                                               positions[start:start + length], self.topk_tokens)
+                selected = physical[logical.clamp_min(0)].masked_fill(logical < 0, -1)
+                out[start:start + length, :selected.shape[1]] = selected.to(out.dtype)
+                if batch == 1:
+                    count = physical.shape[0] // 4
+                    if count > 0:
+                        pooled_keys = raw[:count * 4, :128].view(count, 4, 128).float()
+                        logits = raw[:count * 4, 128:256].view(count, 4, 128).float() + self.index_kpool_compress_ape.float()
+                        pooled = (logits.softmax(dim=1) * pooled_keys).sum(1).to(torch.bfloat16)
+                        values, scales = fwht128_quant_values(pooled.contiguous())
+                        cached_pools = values.float() * scales
+                    else:
+                        cached_pools = torch.empty(0, 128, device=x.device, dtype=torch.float32)
+                    self._cached_pools = (cached_pools, physical)
+            return out
+
+        if q.shape[0] == 1 and self._cached_pools is not None:
+            cached_pools, cached_physical = self._cached_pools
+            pos = positions[0].item()
+            if cached_physical.shape[0] == pos:
+                cached_physical = torch.cat([cached_physical, slots[:1]])
+                total_tokens = cached_physical.shape[0]
+                count = total_tokens // 4
+                if count > cached_pools.shape[0]:
+                    new_slots = cached_physical[(count - 1) * 4 : count * 4]
+                    raw_new = cache.index_select(0, new_slots)
+                    k_new = raw_new[:, :128].view(1, 4, 128).float()
+                    g_new = raw_new[:, 128:256].view(1, 4, 128).float() + self.index_kpool_compress_ape.float()
+                    p_new = (g_new.softmax(dim=1) * k_new).sum(1).to(torch.bfloat16)
+                    v_new, s_new = fwht128_quant_values(p_new.contiguous())
+                    new_pool = v_new.float() * s_new
+                    cached_pools = torch.cat([cached_pools, new_pool], dim=0)
+                self._cached_pools = (cached_pools, cached_physical)
+
+                width = self.topk_tokens + 3
+                result = torch.full((1, width), -1, device=x.device, dtype=torch.long)
+                if total_tokens <= self.topk_tokens:
+                    ids = torch.arange(total_tokens, device=x.device)
+                    result[:, :ids.numel()] = ids[None, :].masked_fill(ids[None, :] > pos, -1)
+                else:
+                    take = min(self.topk_tokens // 4, count)
+                    pool_ids = torch.arange(count, device=x.device)
+                    scores = torch.matmul(q.float(), cached_pools.T).relu()
+                    scores = (scores * weights[:, :, None]).sum(1)
+                    completed = (pos + 1) // 4
+                    scores.masked_fill_(pool_ids[None, :] >= completed, -torch.inf)
+                    ranked, selected_p = scores.topk(take, dim=-1)
+                    offsets = torch.arange(4, device=x.device)
+                    tokens = (selected_p[:, :, None] * 4 + offsets).reshape(1, -1)
+                    tokens.masked_fill_(ranked.isneginf().repeat_interleave(4, dim=1), -1)
+                    result[:, :take * 4] = tokens
+                    tail = completed * 4 + offsets[:3]
+                    result[:, self.topk_tokens:] = tail.unsqueeze(0).masked_fill(tail.unsqueeze(0) > pos, -1)
+                selected = cached_physical[result.clamp_min(0)].masked_fill(result < 0, -1)
+                out[:1, :selected.shape[1]] = selected.to(out.dtype)
+                return out
+
+        block_list = _cpu_metadata("block_list").tolist()
+        owners = _cpu_metadata("block_groups").tolist()
+        usage = _cpu_metadata("block_usage").round().long().tolist()
+        requests = []
+        for row in range(q.shape[0]):
+            physical = [
+                b * meta.block_size + j for b, owner, used in zip(block_list, owners, usage) if owner == row
+                for j in range(used)
+            ]
+            requests.append((row, 1, torch.tensor(physical, device=x.device, dtype=torch.long)))
         for start, length, physical in requests:
             if length == 0 or physical.numel() == 0:
                 continue

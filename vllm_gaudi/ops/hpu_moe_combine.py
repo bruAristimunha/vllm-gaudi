@@ -55,10 +55,10 @@ def gather_silu_fp8_moe(
     over the routed experts, each expert computed as silu(w13 x) w2.
     """
     # shortcut: bounded token slices cap temporary weights; tune after model parity.
-    if swiglu_limit is not None and x.shape[0] > 8:
+    if swiglu_limit is not None and x.shape[0] > 32:
         return torch.cat([
-            gather_silu_fp8_moe(layer, x[i:i + 8], topk_ids[i:i + 8], topk_weights[i:i + 8], swiglu_limit)
-            for i in range(0, x.shape[0], 8)
+            gather_silu_fp8_moe(layer, x[i:i + 32], topk_ids[i:i + 32], topk_weights[i:i + 32], swiglu_limit)
+            for i in range(0, x.shape[0], 32)
         ])
     # Quantization stays eager: compiling across its FP8 boundary changes values.
     x_fp8, x_scale = _dynamic_quant(x)

@@ -68,17 +68,17 @@ def test_compiled_clamped_experts_preserve_eager_quantization():
         local_num_experts=7,
         moe_config=SimpleNamespace(ep_rank=1))
     with torch.inference_mode():
-        for tokens, magnitude in ((1, 1.), (8, 10.), (9, 0.), (9, 1.)):
+        for tokens, magnitude in ((1, 1.), (8, 10.), (32, 10.), (33, 1.)):
             x = (torch.randn(tokens, 128, generator=generator) * magnitude).bfloat16().to('hpu')
             # Duplicate routes and nonlocal experts exercise scatter-add and masking.
             ids = torch.tensor([7, 7, 9, 13, 0, 15]).repeat(tokens, 1).to('hpu')
             weights = torch.rand(tokens, 6, generator=generator).softmax(-1).bfloat16().to('hpu')
             expected = []
-            for start in range(0, tokens, 8):
-                chunk = x[start:start + 8]
+            for start in range(0, tokens, 32):
+                chunk = x[start:start + 32]
                 fp8, scale = _dynamic_quant(chunk)
                 expected.append(
-                    _gather_from_quantized(layer, chunk, ids[start:start + 8], weights[start:start + 8], fp8, scale,
+                    _gather_from_quantized(layer, chunk, ids[start:start + 32], weights[start:start + 32], fp8, scale,
                                            10.))
             expected = torch.cat(expected).float()
             actual = gather_silu_fp8_moe(layer, x, ids, weights, 10.).float()
