@@ -8,6 +8,8 @@ Raw keys and gates occupy a padded BF16 cache with the same page geometry as the
 
 The Hadamard/quantization helper intentionally breaks compilation: the tested HPU compiler removes required BF16 rounding in a FP32-to-BF16-to-FP32 round trip. Do not remove this boundary without exact quantization tests.
 
+The FP32 Sinkhorn loop inside mHC is compiled separately to reduce repeated host dispatch. Projection, mixing logits, and the BF16 output conversion remain eager: compiling the entire native mHC operation changes some BF16 outputs. Component tests require unchanged projection outputs and bound the FP32 combination-matrix error against both the native HPU path and CPU reference. This does not enable whole-model compilation or HPU Graphs.
+
 Validation includes pooled-selection causality and tails, a CPU sequential recurrence oracle for KDA, and complete small-architecture generation with seeded test weights. The small architecture includes KDA, sparse MLA, MoE, and mHC. The official FP8 checkpoint also loaded with TP4 on Gaudi2 and passed arithmetic streaming, a tool-call round trip, and a retrieval prompt beyond the sparse top-k length. These smoke tests do not establish broad quality parity, vision support, or production performance. The manual serving card is `tests/models/language/generation/model_cards/GLM-5.3-Flash.yaml`; no lm-eval accuracy baseline is claimed.
 
 Single-token KDA uses the direct recurrence instead of constructing and solving a one-token chunk. Prefill retains the reviewed chunk operator. Both paths are checked against the sequential CPU oracle.

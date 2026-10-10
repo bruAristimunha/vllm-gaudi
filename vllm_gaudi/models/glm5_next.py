@@ -9,6 +9,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.glm5next.nvidia import attention, kda, model
 from vllm_gaudi.ops.hpu_glm_keypool import fwht128_quant_values, select_pooled_tokens
+from vllm_gaudi.ops.hpu_glm_mhc import hpu_mhc_pre
 from vllm_gaudi.ops.hpu_kda_pytorch import hpu_chunk_kda
 
 
@@ -182,7 +183,8 @@ class HpuDecoderLayer(model.Glm5NextDecoderLayer):
             vllm_config.kernel_config.enable_jit_warmup = warmup
 
     def hc_pre(self, x, hc_fn, hc_scale, hc_base, norm_weight=None, norm_eps=0.0):
-        post, comb, layer_input = super().hc_pre(x, hc_fn, hc_scale, hc_base)
+        post, comb, layer_input = hpu_mhc_pre(x, hc_fn, hc_scale, hc_base, self.rms_norm_eps, self.hc_eps, self.hc_eps,
+                                              self.mhc_post_mult_value, self.mhc_sinkhorn_iterations)
         # The upstream native mHC fallback ignores the fused norm arguments.
         if norm_weight is not None:
             value = layer_input.float()
