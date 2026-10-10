@@ -87,3 +87,38 @@ def test_compiled_clamped_experts_preserve_eager_quantization():
             torch.testing.assert_close(actual, expected, rtol=.0078125, atol=.0005)
             relative_rms = error.square().mean().sqrt() / expected.square().mean().sqrt().clamp_min(1e-8)
             assert relative_rms.item() <= .0001
+
+
+def test_dynamic_quant_per_row_preserves_fp8_bytes_and_scales():
+    def reference_quant(data, single_scale=False):
+        if single_scale:
+            scale = ((torch.abs(data)).max() + 1e-8) / ops.FP8_MAX
+        else:
+            scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / ops.FP8_MAX
+            scale = scale.unsqueeze(-1)
+        data_fp8 = torch.ops.hpu.cast_to_fp8_v2(data, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]
+        return data_fp8, scale.float()
+
+    generator = torch.Generator().manual_seed(42)
+    width = 4096
+    for rows in (1, 8, 256):
+        t_rand = torch.randn(rows, width, generator=generator).bfloat16().to('hpu')
+        t_zero = torch.zeros(rows, width, dtype=torch.bfloat16, device='hpu')
+        t_tied = torch.randn(rows, width, generator=generator).bfloat16().to('hpu')
+        t_tied[:, :5] = 42.0
+        t_large = (torch.rand(rows, width, generator=generator) * 1e4).bfloat16().to('hpu')
+        t_noncontig = torch.randn(rows, width * 2, generator=generator).bfloat16().to('hpu')[:, ::2]
+
+        test_cases = [
+            (t_rand, False),
+            (t_zero, False),
+            (t_tied, False),
+            (t_large, False),
+            (t_noncontig, False),
+            (t_rand, True),
+        ]
+        for data, single_scale in test_cases:
+            ref_fp8, ref_scale = reference_quant(data, single_scale=single_scale)
+            cand_fp8, cand_scale = ops.dynamic_quant(data, single_scale=single_scale)
+            torch.testing.assert_close(cand_scale, ref_scale, rtol=0, atol=0)
+            assert torch.equal(cand_fp8.cpu().view(torch.uint8), ref_fp8.cpu().view(torch.uint8))
