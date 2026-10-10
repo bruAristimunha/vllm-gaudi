@@ -134,3 +134,38 @@ class GlmComponents(unittest.TestCase):
                 self.assertEqual(actual_scales.device.type, "hpu")
                 torch.testing.assert_close(actual_scales.cpu(), scales, atol=0, rtol=0)
                 torch.testing.assert_close(quantized.to(torch.float32).cpu(), expected, atol=0, rtol=0)
+
+    def test_indexer_decode_avoids_position_host_sync(self):
+        from vllm_gaudi.models import glm5_next as glm
+
+        indexer = glm.HpuIndexer.__new__(glm.HpuIndexer)
+        indexer.topk_tokens = 4
+        indexer.topk_indices_buffer = torch.empty(1, 7, dtype=torch.long, device="hpu")
+        indexer.wq_b = lambda x: (torch.zeros(1, 128, device="hpu", dtype=torch.bfloat16), None)
+        indexer.n_head = 1
+        indexer.wk_weights_proj = Mock()
+        indexer.wk_weights_proj.return_value = (torch.zeros(1, 128, device="hpu", dtype=torch.bfloat16), None)
+        indexer.wk_weights_proj.weight = torch.zeros(256, 128, device="hpu")
+        indexer.k_norm = SimpleNamespace(weight=torch.ones(128, device="hpu"), bias=torch.zeros(128, device="hpu"), eps=1e-5)
+        indexer.softmax_scale = 1.0
+        indexer.index_kpool_compress_gate = torch.zeros(128, 128, device="hpu", dtype=torch.bfloat16)
+        indexer.index_kpool_compress_ape = torch.zeros(4, 128, device="hpu", dtype=torch.bfloat16)
+        indexer.k_cache = SimpleNamespace(kv_cache=torch.zeros(100, 256, device="hpu", dtype=torch.bfloat16))
+
+        cached_physical = torch.tensor([10, 11, 12, 13], device="hpu", dtype=torch.long)
+        cached_pools = torch.zeros(1, 128, device="hpu", dtype=torch.float32)
+        indexer._cached_pools = (cached_pools, cached_physical)
+
+        positions = torch.tensor([4], device="hpu")
+        positions_mock = Mock(wraps=positions)
+        positions_mock.item.side_effect = AssertionError("Device sync forced via .item()!")
+        positions_mock.reshape.return_value = positions_mock
+
+        meta = SimpleNamespace(is_prompt=False, slot_mapping=torch.tensor([14], device="hpu"))
+        hidden = torch.zeros(1, 128, device="hpu", dtype=torch.bfloat16)
+
+        with patch.object(glm, "get_forward_context", return_value=SimpleNamespace(attn_metadata=meta)):
+            out = indexer.forward(hidden, hidden, positions_mock, None)
+        self.assertEqual(out.device.type, "hpu")
+        self.assertEqual(indexer._cached_pools[1].numel(), 5)
+

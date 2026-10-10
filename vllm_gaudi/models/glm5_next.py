@@ -9,7 +9,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.glm5next.nvidia import attention, kda, model
 from vllm_gaudi.ops.hpu_glm_keypool import fwht128_quant_values, select_pooled_tokens
-from vllm_gaudi.ops.hpu_glm_mhc import hpu_mhc_pre
+from vllm_gaudi.ops.hpu_glm_mhc import hpu_mhc_post, hpu_mhc_pre
 from vllm_gaudi.ops.hpu_kda_pytorch import hpu_chunk_kda
 
 
@@ -100,44 +100,44 @@ class HpuIndexer(attention.Indexer):
 
         if q.shape[0] == 1 and self._cached_pools is not None:
             cached_pools, cached_physical = self._cached_pools
-            pos = positions[0].item()
-            if cached_physical.shape[0] == pos:
-                cached_physical = torch.cat([cached_physical, slots[:1]])
-                total_tokens = cached_physical.shape[0]
-                count = total_tokens // 4
-                if count > cached_pools.shape[0]:
-                    new_slots = cached_physical[(count - 1) * 4 : count * 4]
-                    raw_new = cache.index_select(0, new_slots)
-                    k_new = raw_new[:, :128].view(1, 4, 128).float()
-                    g_new = raw_new[:, 128:256].view(1, 4, 128).float() + self.index_kpool_compress_ape.float()
-                    p_new = (g_new.softmax(dim=1) * k_new).sum(1).to(torch.bfloat16)
-                    v_new, s_new = fwht128_quant_values(p_new.contiguous())
-                    new_pool = v_new.float() * s_new
-                    cached_pools = torch.cat([cached_pools, new_pool], dim=0)
-                self._cached_pools = (cached_pools, cached_physical)
+            pos = cached_physical.shape[0]
+            cached_physical = torch.cat([cached_physical, slots[:1]])
+            total_tokens = cached_physical.shape[0]
+            count = total_tokens // 4
+            if count > cached_pools.shape[0]:
+                new_slots = cached_physical[(count - 1) * 4 : count * 4]
+                raw_new = cache.index_select(0, new_slots)
+                k_new = raw_new[:, :128].view(1, 4, 128).float()
+                g_new = raw_new[:, 128:256].view(1, 4, 128).float() + self.index_kpool_compress_ape.float()
+                p_new = (g_new.softmax(dim=1) * k_new).sum(1).to(torch.bfloat16)
+                v_new, s_new = fwht128_quant_values(p_new.contiguous())
+                new_pool = v_new.float() * s_new
+                cached_pools = torch.cat([cached_pools, new_pool], dim=0)
+            self._cached_pools = (cached_pools, cached_physical)
 
-                width = self.topk_tokens + 3
-                result = torch.full((1, width), -1, device=x.device, dtype=torch.long)
-                if total_tokens <= self.topk_tokens:
-                    ids = torch.arange(total_tokens, device=x.device)
-                    result[:, :ids.numel()] = ids[None, :].masked_fill(ids[None, :] > pos, -1)
-                else:
-                    take = min(self.topk_tokens // 4, count)
-                    pool_ids = torch.arange(count, device=x.device)
-                    scores = torch.matmul(q.float(), cached_pools.T).relu()
-                    scores = (scores * weights[:, :, None]).sum(1)
-                    completed = (pos + 1) // 4
-                    scores.masked_fill_(pool_ids[None, :] >= completed, -torch.inf)
-                    ranked, selected_p = scores.topk(take, dim=-1)
-                    offsets = torch.arange(4, device=x.device)
-                    tokens = (selected_p[:, :, None] * 4 + offsets).reshape(1, -1)
-                    tokens.masked_fill_(ranked.isneginf().repeat_interleave(4, dim=1), -1)
-                    result[:, :take * 4] = tokens
-                    tail = completed * 4 + offsets[:3]
-                    result[:, self.topk_tokens:] = tail.unsqueeze(0).masked_fill(tail.unsqueeze(0) > pos, -1)
-                selected = cached_physical[result.clamp_min(0)].masked_fill(result < 0, -1)
-                out[:1, :selected.shape[1]] = selected.to(out.dtype)
-                return out
+            width = self.topk_tokens + 3
+            result = torch.full((1, width), -1, device=x.device, dtype=torch.long)
+            if total_tokens <= self.topk_tokens:
+                ids = torch.arange(total_tokens, device=x.device)
+                result[:, :ids.numel()] = ids[None, :]
+            else:
+                take = min(self.topk_tokens // 4, count)
+                pool_ids = torch.arange(count, device=x.device)
+                scores = torch.matmul(q.float(), cached_pools.T).relu()
+                scores = (scores * weights[:, :, None]).sum(1)
+                completed = (pos + 1) // 4
+                scores.masked_fill_(pool_ids[None, :] >= completed, -torch.inf)
+                ranked, selected_p = scores.topk(take, dim=-1)
+                if not hasattr(self, "_offsets"):
+                    self._offsets = torch.arange(4, device=x.device)
+                tokens = (selected_p[:, :, None] * 4 + self._offsets).reshape(1, -1)
+                tokens.masked_fill_(ranked.isneginf().repeat_interleave(4, dim=1), -1)
+                result[:, :take * 4] = tokens
+                tail = completed * 4 + self._offsets[:3]
+                result[:, self.topk_tokens:] = tail.unsqueeze(0).masked_fill(tail.unsqueeze(0) > pos, -1)
+            selected = cached_physical[result.clamp_min(0)].masked_fill(result < 0, -1)
+            out[:1, :selected.shape[1]] = selected.to(out.dtype)
+            return out
 
         block_list = _cpu_metadata("block_list").tolist()
         owners = _cpu_metadata("block_groups").tolist()
@@ -181,19 +181,28 @@ class HpuKda(kda.Glm5NextLinearAttention):
             self.A_log.float().exp() * decay.view(1, -1, self.local_num_heads, self.head_dim))
         beta = beta.float().sigmoid()
         conv, recurrent = self.kv_cache
-        load = _cpu_metadata("load_indices_tensor")
-        store = _cpu_metadata("store_indices_tensor")
-        if load.ndim > 1:
-            if self.cache_group_idx is None:
-                raise RuntimeError("KDA cache group was not bound")
-            load = load[self.cache_group_idx]
-            store = store[self.cache_group_idx]
-        load_ids, store_ids = load.tolist(), store.tolist()
+        cache_key = ("glm_kda_meta", self.cache_group_idx)
+        context = get_forward_context()
+        if cache_key not in context.additional_kwargs:
+            load = _cpu_metadata("load_indices_tensor")
+            store = _cpu_metadata("store_indices_tensor")
+            if load.ndim > 1:
+                if self.cache_group_idx is None:
+                    raise RuntimeError("KDA cache group was not bound")
+                load = load[self.cache_group_idx]
+                store = store[self.cache_group_idx]
+            load_ids, store_ids = load.tolist(), store.tolist()
+            batch = len(load_ids)
+            lengths = _cpu_metadata("seq_lens_tensor").tolist() if meta.is_prompt else [1] * batch
+            initial = _cpu_metadata("has_initial_states_p").tolist() if meta.is_prompt else [True] * batch
+            context.additional_kwargs[cache_key] = (load_ids, store_ids, lengths, initial)
+        else:
+            load_ids, store_ids, lengths, initial = context.additional_kwargs[cache_key]
         batch = len(load_ids)
         stride = x.shape[0] // batch
-        lengths = _cpu_metadata("seq_lens_tensor").tolist() if meta.is_prompt else [1] * batch
-        initial = _cpu_metadata("has_initial_states_p").tolist() if meta.is_prompt else [True] * batch
-        conv_weights = torch.cat([m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
+        if not hasattr(self, "_cached_conv_weights"):
+            self._cached_conv_weights = torch.cat([m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
+        conv_weights = self._cached_conv_weights
         core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         for row, (source, target, length, has_state) in enumerate(zip(load_ids, store_ids, lengths, initial)):
             if source < 0 or target < 0 or length == 0:
@@ -268,10 +277,14 @@ class HpuDecoderLayer(model.Glm5NextDecoderLayer):
             layer_input = (value * norm_weight.float()).to(layer_input.dtype)
         return post, comb, layer_input
 
+    def hc_post(self, x, residual, post, comb):
+        return hpu_mhc_post(x, residual, post, comb)
+
     def hc_fused_post_pre(self, x, residual, post, comb, hc_fn, hc_scale, hc_base, norm_weight=None, norm_eps=0.0):
         residual = self.hc_post(x, residual, post, comb)
         post, comb, value = self.hc_pre(residual, hc_fn, hc_scale, hc_base, norm_weight, norm_eps)
         return residual, post, comb, value
+
 
 
 attention.Glm5NextIndexerCache = HpuIndexerCache

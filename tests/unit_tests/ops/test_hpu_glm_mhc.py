@@ -27,3 +27,24 @@ def test_mhc_sinkhorn_preserves_native_projection_and_rounding():
             torch.testing.assert_close(actual[1].cpu(), cpu[1], atol=2e-6, rtol=2e-5)
             assert actual[1].shape == (tokens, 4, 4)
             torch.testing.assert_close(actual[1].sum(-2).cpu(), torch.ones(tokens, 4), atol=1e-5, rtol=0)
+
+
+def test_hpu_mhc_post_bit_exact():
+    from vllm.model_executor.kernels.mhc import mhc_post_torch
+    from vllm_gaudi.ops.hpu_glm_mhc import hpu_mhc_post
+
+    with torch.inference_mode():
+        for tokens in (1, 2, 8, 33, 128):
+            for seed in (1, 42, 99):
+                gen = torch.Generator().manual_seed(seed)
+                res = torch.randn(tokens, 4, 4096, dtype=torch.bfloat16, generator=gen).to("hpu")
+                x = torch.randn(tokens, 4096, dtype=torch.bfloat16, generator=gen).to("hpu")
+                post = torch.rand(tokens, 4, 1, dtype=torch.float32, generator=gen).to("hpu")
+                comb = torch.rand(tokens, 4, 4, dtype=torch.float32, generator=gen).to("hpu")
+
+                ref = mhc_post_torch(x, res, post, comb)
+                actual = hpu_mhc_post(x, res, post, comb)
+
+                assert actual.device.type == "hpu"
+                torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
