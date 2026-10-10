@@ -69,21 +69,46 @@ def hpu_mhc_pre(
 
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
-    fn_flat = fn
+    fn_t = getattr(fn, "_cached_t", None)
+    if fn_t is None:
+        fn_t = fn.t()
+        try:
+            fn._cached_t = fn_t
+        except Exception:
+            pass
 
     x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn_flat.t())
+    mixes = torch.matmul(x, fn_t)
     sqrsum = x.square().sum(dim=-1, keepdim=True)
     mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
-    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    base_pre = getattr(hc_base, "_cached_pre", None)
+    if base_pre is None or base_pre.shape[0] != hc_mult:
+        base_pre = hc_base[:hc_mult]
+        base_post = hc_base[hc_mult:2 * hc_mult]
+        base_comb = hc_base[2 * hc_mult:].view(1, hc_mult, hc_mult)
+        s0, s1, s2 = hc_scale[0], hc_scale[1], hc_scale[2]
+        try:
+            hc_base._cached_pre = base_pre
+            hc_base._cached_post = base_post
+            hc_base._cached_comb = base_comb
+            hc_scale._cached_s0 = s0
+            hc_scale._cached_s1 = s1
+            hc_scale._cached_s2 = s2
+        except Exception:
+            pass
+    else:
+        base_post = hc_base._cached_post
+        base_comb = hc_base._cached_comb
+        s0, s1, s2 = hc_scale._cached_s0, hc_scale._cached_s1, hc_scale._cached_s2
+
+    pre_logits = mixes[:, :hc_mult] * s0 + base_pre
     pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
 
-    post_logits = (mixes[:, hc_mult:2 * hc_mult] * hc_scale[1] + hc_base[hc_mult:2 * hc_mult])
+    post_logits = mixes[:, hc_mult:2 * hc_mult] * s1 + base_post
     post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
 
-    comb_logits = mixes[:, 2 * hc_mult:].view(num_tokens, hc_mult, hc_mult) * hc_scale[2] + hc_base[2 * hc_mult:].view(
-        1, hc_mult, hc_mult)
+    comb_logits = mixes[:, 2 * hc_mult:].view(num_tokens, hc_mult, hc_mult) * s2 + base_comb
     comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
     comb_mix = _sinkhorn(comp=comb_mix, eps=hc_sinkhorn_eps, iterations=sinkhorn_repeat)
 

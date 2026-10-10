@@ -46,9 +46,13 @@ class HpuIndexer(attention.Indexer):
         q, scale = fwht128_quant_values(q)
         q = q.view(-1, self.n_head, 128)
         kw = self.wk_weights_proj(x)[0]
-        keys = F.layer_norm(kw[:, :128].float(), (128, ), self.k_norm.weight.float(), self.k_norm.bias.float(),
-                            self.k_norm.eps).to(x.dtype)
-        weights = x.float() @ self.wk_weights_proj.weight[128:].float().T
+        if not hasattr(self, "_cached_k_norm_weight_float"):
+            self._cached_k_norm_weight_float = self.k_norm.weight.float()
+            self._cached_k_norm_bias_float = self.k_norm.bias.float() if self.k_norm.bias is not None else None
+            self._cached_wk_weights_float_t = self.wk_weights_proj.weight[128:].float().T
+        keys = F.layer_norm(kw[:, :128].float(), (128, ), self._cached_k_norm_weight_float,
+                            self._cached_k_norm_bias_float, self.k_norm.eps).to(x.dtype)
+        weights = x.float() @ self._cached_wk_weights_float_t
         weights = weights * scale.view(-1, self.n_head) * (self.softmax_scale * self.n_head**-0.5)
         gates = F.linear(x, self.index_kpool_compress_gate)
         cache = self.k_cache.kv_cache
@@ -207,8 +211,11 @@ class HpuKda(kda.Glm5NextLinearAttention):
             weights = torch.cat([m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
             self._cached_conv_weights = weights
             self._cached_conv_weights_float = weights.float().unsqueeze(1)
+            self._cached_conv_weights_2d = weights.float()
         conv_weights_float = self._cached_conv_weights_float
-        core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
+        conv_weights_2d = self._cached_conv_weights_2d
+        core = None if (x.shape[0] == 1 and batch == 1) else torch.zeros(
+            (x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         for row, (source, target, length, has_state) in enumerate(zip(load_ids, store_ids, lengths, initial)):
             if source < 0 or target < 0 or length == 0:
                 continue
@@ -220,8 +227,12 @@ class HpuKda(kda.Glm5NextLinearAttention):
             if not has_state:
                 history = torch.zeros_like(history)
             stream = torch.cat([history, qkv[start:end].float().T], dim=1)
-            filtered = F.conv1d(stream.unsqueeze(0), conv_weights_float, groups=stream.shape[0])
-            filtered = F.silu(filtered.squeeze(0).T).to(x.dtype)
+            if length == 1:
+                conv_out = (stream * conv_weights_2d).sum(dim=-1, keepdim=True).T
+                filtered = F.silu(conv_out).to(x.dtype)
+            else:
+                filtered = F.conv1d(stream.unsqueeze(0), conv_weights_float, groups=stream.shape[0])
+                filtered = F.silu(filtered.squeeze(0).T).to(x.dtype)
             q, k, v = [
                 t.view(1, int(length), self.local_num_heads, self.head_dim)
                 for t in filtered.split(self.local_projection_size, dim=-1)
@@ -234,16 +245,23 @@ class HpuKda(kda.Glm5NextLinearAttention):
                                           beta[start:end].unsqueeze(0),
                                           initial_state=state,
                                           chunk_size=64)
-            core[start:end] = output[0]
+            if core is None:
+                core = output[0]
+            else:
+                core[start:end] = output[0]
             recurrent[target].copy_(final[0])
             tail = stream[:, -(self.conv_size - 1):].to(conv.dtype)
             if self._conv_state_dim_first:
                 conv[target, :, -tail.shape[1]:].copy_(tail)
             else:
                 conv[target, -tail.shape[1]:].copy_(tail.T)
+        if core is None:
+            core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid()
         normed = core.float() * torch.rsqrt(core.float().square().mean(-1, keepdim=True) + self.o_norm.eps)
-        normed = (normed * self.o_norm.weight.float() * gate).to(x.dtype)
+        if not hasattr(self, "_cached_o_norm_weight_float"):
+            self._cached_o_norm_weight_float = self.o_norm.weight.float()
+        normed = (normed * self._cached_o_norm_weight_float * gate).to(x.dtype)
         return self.o_proj(normed.reshape(x.shape[0], -1))[0].view_as(hidden_states)
 
 
@@ -277,9 +295,16 @@ class HpuDecoderLayer(model.Glm5NextDecoderLayer):
                                               self.mhc_post_mult_value, self.mhc_sinkhorn_iterations)
         # The upstream native mHC fallback ignores the fused norm arguments.
         if norm_weight is not None:
+            float_weight = getattr(norm_weight, "_cached_float", None)
+            if float_weight is None:
+                float_weight = norm_weight.float()
+                try:
+                    norm_weight._cached_float = float_weight
+                except Exception:
+                    pass
             value = layer_input.float()
             value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + norm_eps)
-            layer_input = (value * norm_weight.float()).to(layer_input.dtype)
+            layer_input = (value * float_weight).to(layer_input.dtype)
         return post, comb, layer_input
 
     def hc_post(self, x, residual, post, comb):
