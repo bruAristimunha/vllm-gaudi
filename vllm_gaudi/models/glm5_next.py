@@ -70,6 +70,7 @@ class HpuIndexer(attention.Indexer):
         if meta.is_prompt:
             self._cached_pools = None
             self._cached_physical_buf = None
+            self._cached_pools_buf = None
             lengths = _cpu_metadata("seq_lens_tensor").tolist()
             batch = len(lengths)
             stride = slots.numel() // batch
@@ -103,7 +104,11 @@ class HpuIndexer(attention.Indexer):
                         cached_pools = values.float() * scales
                     else:
                         cached_pools = torch.empty(0, 128, device=x.device, dtype=torch.float32)
-                    self._cached_pools = (cached_pools, physical)
+                    buf_p = torch.empty((max(count + 512, 512), 128), dtype=torch.float32, device=x.device)
+                    if count > 0:
+                        buf_p[:count].copy_(cached_pools)
+                    self._cached_pools_buf = buf_p
+                    self._cached_pools = (buf_p[:count], physical)
             return out
 
         if q.shape[0] == 1 and self._cached_pools is not None:
@@ -130,11 +135,24 @@ class HpuIndexer(attention.Indexer):
                 p_new = (g_new.softmax(dim=1) * k_new).sum(1).to(torch.bfloat16)
                 v_new, s_new = fwht128_quant_values(p_new.contiguous())
                 new_pool = v_new.float() * s_new
-                cached_pools = torch.cat([cached_pools, new_pool], dim=0)
+                buf_p = getattr(self, "_cached_pools_buf", None)
+                if buf_p is None or buf_p.shape[0] < count:
+                    new_cap = max(count + 256, count * 2 if count > 0 else 256)
+                    buf_p = torch.empty((new_cap, 128), dtype=torch.float32, device=x.device)
+                    if cached_pools.shape[0] > 0:
+                        buf_p[:cached_pools.shape[0]].copy_(cached_pools)
+                    self._cached_pools_buf = buf_p
+                buf_p[count - 1].copy_(new_pool[0])
+                cached_pools = buf_p[:count]
             self._cached_pools = (cached_pools, cached_physical)
 
             width = self.topk_tokens + 3
-            result = torch.full((1, width), -1, device=x.device, dtype=torch.long)
+            result = getattr(self, "_cached_index_result_buf", None)
+            if result is None:
+                result = torch.full((1, width), -1, device=x.device, dtype=torch.long)
+                self._cached_index_result_buf = result
+            else:
+                result.fill_(-1)
             if total_tokens <= self.topk_tokens:
                 ids = torch.arange(total_tokens, device=x.device)
                 result[:, :ids.numel()] = ids[None, :]
@@ -143,13 +161,16 @@ class HpuIndexer(attention.Indexer):
                 scores = torch.matmul(q.float(), cached_pools.T).relu()
                 scores = (scores * weights[:, :, None]).sum(1)
                 ranked, selected_p = scores.topk(take, dim=-1)
-                if not hasattr(self, "_offsets"):
-                    self._offsets = torch.arange(4, device=x.device)
-                tokens = (selected_p[:, :, None] * 4 + self._offsets).reshape(1, -1)
+                offsets = getattr(self, "_cached_offsets_4", None)
+                if offsets is None:
+                    offsets = torch.arange(4, device=x.device)
+                    self._cached_offsets_4 = offsets
+                    self._cached_offsets_3 = torch.arange(3, device=x.device)
+                tokens = (selected_p[:, :, None] * 4 + offsets).reshape(1, -1)
                 tokens.masked_fill_(ranked.isneginf().repeat_interleave(4, dim=1), -1)
                 result[:, :take * 4] = tokens
-                tail = count * 4 + self._offsets[:3]
-                result[:, self.topk_tokens:] = tail.unsqueeze(0).masked_fill(tail.unsqueeze(0) > pos, -1)
+                tail_2d = (count * 4 + self._cached_offsets_3).unsqueeze(0)
+                result[:, self.topk_tokens:] = tail_2d.masked_fill(tail_2d > pos, -1)
             selected = cached_physical[result.clamp_min(0)].masked_fill(result < 0, -1)
             out[:1, :selected.shape[1]] = selected.to(out.dtype)
             return out
@@ -191,13 +212,17 @@ class HpuKda(kda.Glm5NextLinearAttention):
         projected = self.in_proj_qkvbfg_a(x)[0]
         qkv, beta, fa, ga = projected.split(
             [3 * self.local_projection_size, self.local_num_heads, self.head_dim, self.head_dim], dim=-1)
-        if not hasattr(self, "_cached_dt_bias_float"):
-            self._cached_dt_bias_float = self.dt_bias.float()
-        decay = self.f_b_proj(fa)[0].float() + self._cached_dt_bias_float
-        if not hasattr(self, "_cached_A_exp"):
-            self._cached_A_exp = self.A_log.float().exp()
+        decay_dt_bias = getattr(self, "_cached_dt_bias_float", None)
+        if decay_dt_bias is None:
+            decay_dt_bias = self.dt_bias.float()
+            self._cached_dt_bias_float = decay_dt_bias
+        decay = self.f_b_proj(fa)[0].float() + decay_dt_bias
+        a_exp = getattr(self, "_cached_A_exp", None)
+        if a_exp is None:
+            a_exp = self.A_log.float().exp()
+            self._cached_A_exp = a_exp
         decay = self.kda_lower_bound * torch.sigmoid(
-            self._cached_A_exp * decay.view(1, -1, self.local_num_heads, self.head_dim))
+            a_exp * decay.view(1, -1, self.local_num_heads, self.head_dim))
         beta = beta.float().sigmoid()
         conv, recurrent = self.kv_cache
         cache_key = ("glm_kda_meta", self.cache_group_idx)
@@ -219,12 +244,13 @@ class HpuKda(kda.Glm5NextLinearAttention):
             load_ids, store_ids, lengths, initial = context.additional_kwargs[cache_key]
         batch = len(load_ids)
         stride = x.shape[0] // batch
-        if not hasattr(self, "_cached_conv_weights"):
+        conv_weights_float = getattr(self, "_cached_conv_weights_float", None)
+        if conv_weights_float is None:
             weights = torch.cat([m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
             self._cached_conv_weights = weights
-            self._cached_conv_weights_float = weights.float().unsqueeze(1)
+            conv_weights_float = weights.float().unsqueeze(1)
+            self._cached_conv_weights_float = conv_weights_float
             self._cached_conv_weights_2d = weights.float()
-        conv_weights_float = self._cached_conv_weights_float
         conv_weights_2d = self._cached_conv_weights_2d
         core = None if (x.shape[0] == 1 and batch == 1) else torch.zeros(
             (x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
@@ -271,10 +297,11 @@ class HpuKda(kda.Glm5NextLinearAttention):
             core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid()
         core_f = core.float()
-        normed = core_f * torch.rsqrt(core_f.square().mean(-1, keepdim=True) + self.o_norm.eps)
-        if not hasattr(self, "_cached_o_norm_weight_float"):
-            self._cached_o_norm_weight_float = self.o_norm.weight.float()
-        normed = (normed * self._cached_o_norm_weight_float * gate).to(x.dtype)
+        o_norm_weight = getattr(self, "_cached_o_norm_weight_float", None)
+        if o_norm_weight is None:
+            o_norm_weight = self.o_norm.weight.float()
+            self._cached_o_norm_weight_float = o_norm_weight
+        normed = (normed * o_norm_weight * gate).to(x.dtype)
         return self.o_proj(normed.reshape(x.shape[0], -1))[0].view_as(hidden_states)
 
 
