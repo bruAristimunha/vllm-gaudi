@@ -302,7 +302,7 @@ class HpuKda(kda.Glm5NextLinearAttention):
         if o_norm_weight is None:
             o_norm_weight = self.o_norm.weight.float()
             self._cached_o_norm_weight_float = o_norm_weight
-        normed = (normed * o_norm_weight * gate).to(x.dtype)
+        normed = normed.mul_(o_norm_weight).mul_(gate).to(x.dtype)
         return self.o_proj(normed.reshape(x.shape[0], -1))[0].view_as(hidden_states)
 
 

@@ -139,6 +139,23 @@ def _decay_dot(
     return torch.cat(blocks, dim=1) if len(blocks) > 1 else blocks[0]
 
 
+@torch.compile(backend="hpu_backend", fullgraph=True, dynamic=True)
+def _hpu_kda_single_decode_step(
+    q_step: torch.Tensor,
+    k_step: torch.Tensor,
+    v_step: torch.Tensor,
+    g_step: torch.Tensor,
+    beta_step: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    state = state * g_step.exp().unsqueeze(-1)
+    residual = v_step - torch.matmul(k_step.unsqueeze(-2), state).squeeze(-2)
+    update = residual * beta_step.unsqueeze(-1)
+    state = state + torch.matmul(k_step.unsqueeze(-1), update.unsqueeze(-2))
+    out = torch.matmul(q_step.unsqueeze(-2), state).transpose(1, 2)
+    return out, state
+
+
 def hpu_chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -180,13 +197,9 @@ def hpu_chunk_kda(
 
     if T == 1:
         # One decode token needs only the recurrence, not a triangular chunk solve.
-        state = initial_state if initial_state is not None else q.new_zeros(S, H, D, Vdim)
-        state = state.float() * g[:, 0].exp().unsqueeze(-1)
-        residual = v[:, 0] - torch.matmul(k[:, 0].unsqueeze(-2), state).squeeze(-2)
-        update = residual * beta[:, 0].unsqueeze(-1)
-        state = state + torch.matmul(k[:, 0].unsqueeze(-1), update.unsqueeze(-2))
-        out = torch.matmul(q[:, 0].unsqueeze(-2), state).transpose(1, 2).to(in_dtype)
-        return out, state if output_final_state else None
+        state = initial_state.float() if initial_state is not None else q.new_zeros(S, H, D, Vdim)
+        out, state = _hpu_kda_single_decode_step(q[:, 0], k[:, 0], v[:, 0], g[:, 0], beta[:, 0], state)
+        return out.to(in_dtype), state if output_final_state else None
 
     # pad to chunk multiple (g padded with zeros: no decay in padding, so the
     # per-chunk cumsum stays constant after the last real token)
