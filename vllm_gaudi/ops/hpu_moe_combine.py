@@ -145,7 +145,7 @@ def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swi
     if swiglu_limit is not None:
         gate = gate.clamp(max=swiglu_limit)
         up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-    activations = gate * torch.sigmoid(gate) * up  # silu(gate)*up, [G,T,I] f32
+    activations = (gate * torch.sigmoid(gate)).mul_(up)  # silu(gate)*up, [G,T,I] f32
 
     # DOWN projection: act has a wide dynamic range (silu output), so it CANNOT
     # be fp8-quantized without losing ~2-6% precision (fp8 has only 3 mantissa
@@ -154,7 +154,7 @@ def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swi
     # activations. So the down projection dequantizes w2 to fp32 and runs a plain
     # fp32 bmm (same as the baseline); only the UP/GATE projection runs in native
     # fp8.
-    w2_float = w2_gathered.float() * scale2_gathered.unsqueeze(-1)  # [G, H, I] f32
+    w2_float = w2_gathered.float().mul_(scale2_gathered.unsqueeze(-1))  # [G, H, I] f32
     expert_outputs = torch.bmm(activations, w2_float.transpose(1, 2))  # [G, T, H] f32
 
     # ---- weighted sum over experts -> [T, H] ----

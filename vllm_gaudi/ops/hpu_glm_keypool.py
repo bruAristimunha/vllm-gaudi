@@ -69,5 +69,5 @@ def select_pooled_tokens(q, weights, keys, gates, ape, positions, topk):
         tokens.masked_fill_(ranked.isneginf().repeat_interleave(pool_size, dim=1), -1)
         result[start:end, :take * pool_size] = tokens
         tail = completed[:, None] * pool_size + offsets[:pool_size - 1]
-        result[start:end, topk:] = tail.masked_fill(tail > positions[start:end, None], -1)
+        result[start:end, topk:] = tail.masked_fill_(tail > positions[start:end, None], -1)
     return result

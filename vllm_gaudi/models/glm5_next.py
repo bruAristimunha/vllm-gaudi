@@ -165,12 +165,12 @@ class HpuIndexer(attention.Indexer):
                 if offsets is None:
                     offsets = torch.arange(4, device=x.device)
                     self._cached_offsets_4 = offsets
-                    self._cached_offsets_3 = torch.arange(3, device=x.device)
+                    self._cached_offsets_3 = torch.arange(3, device=x.device).unsqueeze(0)
                 tokens = (selected_p[:, :, None] * 4 + offsets).reshape(1, -1)
                 tokens.masked_fill_(ranked.isneginf().repeat_interleave(4, dim=1), -1)
                 result[:, :take * 4] = tokens
-                tail_2d = (count * 4 + self._cached_offsets_3).unsqueeze(0)
-                result[:, self.topk_tokens:] = tail_2d.masked_fill(tail_2d > pos, -1)
+                tail_2d = count * 4 + self._cached_offsets_3
+                result[:, self.topk_tokens:] = tail_2d.masked_fill_(tail_2d > pos, -1)
             selected = cached_physical[result.clamp_min(0)].masked_fill(result < 0, -1)
             out[:1, :selected.shape[1]] = selected.to(out.dtype)
             return out
