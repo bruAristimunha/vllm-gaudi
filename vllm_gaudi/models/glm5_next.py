@@ -50,10 +50,11 @@ class HpuIndexer(attention.Indexer):
             self._cached_k_norm_weight_float = self.k_norm.weight.float()
             self._cached_k_norm_bias_float = self.k_norm.bias.float() if self.k_norm.bias is not None else None
             self._cached_wk_weights_float_t = self.wk_weights_proj.weight[128:].float().T
+            self._cached_scale_factor = self.softmax_scale * (self.n_head**-0.5)
         keys = F.layer_norm(kw[:, :128].float(), (128, ), self._cached_k_norm_weight_float,
                             self._cached_k_norm_bias_float, self.k_norm.eps).to(x.dtype)
         weights = x.float() @ self._cached_wk_weights_float_t
-        weights = weights * scale.view(-1, self.n_head) * (self.softmax_scale * self.n_head**-0.5)
+        weights = weights * scale.view(-1, self.n_head) * self._cached_scale_factor
         gates = F.linear(x, self.index_kpool_compress_gate)
         cache = self.k_cache.kv_cache
         if isinstance(cache, (tuple, list)):
@@ -68,6 +69,7 @@ class HpuIndexer(attention.Indexer):
         # Only scheduling metadata crosses to the host; model values stay on HPU.
         if meta.is_prompt:
             self._cached_pools = None
+            self._cached_physical_buf = None
             lengths = _cpu_metadata("seq_lens_tensor").tolist()
             batch = len(lengths)
             stride = slots.numel() // batch
@@ -107,8 +109,16 @@ class HpuIndexer(attention.Indexer):
         if q.shape[0] == 1 and self._cached_pools is not None:
             cached_pools, cached_physical = self._cached_pools
             pos = cached_physical.shape[0]
-            cached_physical = torch.cat([cached_physical, slots[:1]])
-            total_tokens = cached_physical.shape[0]
+            buf = getattr(self, "_cached_physical_buf", None)
+            if buf is None or buf.shape[0] <= pos:
+                new_cap = max(pos + 512, pos * 2 if pos > 0 else 512)
+                buf = torch.empty(new_cap, dtype=slots.dtype, device=slots.device)
+                if pos > 0:
+                    buf[:pos].copy_(cached_physical)
+                self._cached_physical_buf = buf
+            buf[pos] = slots[0]
+            cached_physical = buf[:pos + 1]
+            total_tokens = pos + 1
             count = total_tokens // 4
             if count > cached_pools.shape[0]:
                 if not hasattr(self, "_cached_compress_ape_float"):
@@ -181,7 +191,9 @@ class HpuKda(kda.Glm5NextLinearAttention):
         projected = self.in_proj_qkvbfg_a(x)[0]
         qkv, beta, fa, ga = projected.split(
             [3 * self.local_projection_size, self.local_num_heads, self.head_dim, self.head_dim], dim=-1)
-        decay = self.f_b_proj(fa)[0].float() + self.dt_bias
+        if not hasattr(self, "_cached_dt_bias_float"):
+            self._cached_dt_bias_float = self.dt_bias.float()
+        decay = self.f_b_proj(fa)[0].float() + self._cached_dt_bias_float
         if not hasattr(self, "_cached_A_exp"):
             self._cached_A_exp = self.A_log.float().exp()
         decay = self.kda_lower_bound * torch.sigmoid(
@@ -258,7 +270,8 @@ class HpuKda(kda.Glm5NextLinearAttention):
         if core is None:
             core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid()
-        normed = core.float() * torch.rsqrt(core.float().square().mean(-1, keepdim=True) + self.o_norm.eps)
+        core_f = core.float()
+        normed = core_f * torch.rsqrt(core_f.square().mean(-1, keepdim=True) + self.o_norm.eps)
         if not hasattr(self, "_cached_o_norm_weight_float"):
             self._cached_o_norm_weight_float = self.o_norm.weight.float()
         normed = (normed * self._cached_o_norm_weight_float * gate).to(x.dtype)
