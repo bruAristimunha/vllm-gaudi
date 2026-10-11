@@ -4,6 +4,15 @@
 import torch
 
 
+@torch.compile(backend="hpu_backend", fullgraph=True, dynamic=True)
+def _fwht128(x: torch.Tensor) -> torch.Tensor:
+    rows = x.shape[0]
+    for stride in (1, 2, 4, 8, 16, 32, 64):
+        a, b = x.reshape(rows, 128 // (2 * stride), 2, stride).unbind(2)
+        x = torch.stack((a + b, a - b), dim=2).reshape(rows, 128)
+    return x
+
+
 @torch._dynamo.disable
 def fwht128_quant_values(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Preserve official FWHT/FP8 numeric values without Gaudi2's FP8 cast overflow.
@@ -14,11 +23,8 @@ def fwht128_quant_values(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert q.device.type == "hpu"
     assert q.ndim == 2 and q.shape[1] == 128 and q.dtype == torch.bfloat16
     assert q.is_contiguous()
-    rows = q.shape[0]
-    x = q.float()
-    for stride in (1, 2, 4, 8, 16, 32, 64):
-        a, b = x.reshape(rows, 128 // (2 * stride), 2, stride).unbind(2)
-        x = torch.stack((a + b, a - b), dim=2).reshape(rows, 128)
+    x = _fwht128(q.float())
+    # Keep the BF16 roundtrip eager so compilation cannot remove its rounding.
     x = (x * 0.08838834764831845).to(torch.bfloat16).float()
     scale = torch.exp2(torch.ceil(torch.log2(x.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448)))
     y = (x / scale).clamp(-448, 448)

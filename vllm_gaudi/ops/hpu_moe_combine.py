@@ -105,7 +105,7 @@ def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swi
     # static (no torch.nonzero, no `if G == 0`) lets this capture cleanly into a
     # compiled HPU graph (mirrors _gather_swigluoai_moe).
     gathered_experts = min(local_experts, tokens * num_topk)
-    hit_counts = (gate_weights != 0).float().sum(0)  # [E]
+    hit_counts = (gate_weights[0] != 0).float() if tokens == 1 else (gate_weights != 0).float().sum(0)
     gather_ids = torch.topk(hit_counts, gathered_experts, sorted=False).indices  # [G]
     gather_ids, _ = torch.sort(gather_ids)  # ascending ids
 
@@ -159,5 +159,5 @@ def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swi
 
     # ---- weighted sum over experts -> [T, H] ----
     gathered_weights = gate_weights.index_select(1, gather_ids).t()  # [G, T]
-    out = (expert_outputs * gathered_weights.unsqueeze(-1)).sum(0)  # [T, H] f32
+    out = expert_outputs.mul_(gathered_weights.unsqueeze(-1)).sum(0)  # [T, H] f32
     return out.to(x.dtype)
