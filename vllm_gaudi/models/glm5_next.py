@@ -344,8 +344,8 @@ class HpuDecoderLayer(model.Glm5NextDecoderLayer):
                 except Exception:
                     pass
             value = layer_input.float()
-            value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + norm_eps)
-            layer_input = (value * float_weight).to(layer_input.dtype)
+            value = value.mul_(torch.rsqrt(value.square().mean(-1, keepdim=True) + norm_eps))
+            layer_input = value.mul_(float_weight).to(layer_input.dtype)
         return post, comb, layer_input
 
     def hc_post(self, x, residual, post, comb):
