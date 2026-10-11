@@ -297,6 +297,7 @@ class HpuKda(kda.Glm5NextLinearAttention):
             core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid()
         core_f = core.float()
+        normed = core_f * torch.rsqrt(core_f.square().mean(-1, keepdim=True) + self.o_norm.eps)
         o_norm_weight = getattr(self, "_cached_o_norm_weight_float", None)
         if o_norm_weight is None:
             o_norm_weight = self.o_norm.weight.float()
