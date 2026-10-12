@@ -225,14 +225,13 @@ class HpuKda(kda.Glm5NextLinearAttention):
         if decay_dt_bias is None:
             decay_dt_bias = self.dt_bias.float()
             self._cached_dt_bias_float = decay_dt_bias
-        decay = self.f_b_proj(fa)[0].float() + decay_dt_bias
+        decay = self.f_b_proj(fa)[0].float().add_(decay_dt_bias)
         a_exp = getattr(self, "_cached_A_exp", None)
         if a_exp is None:
             a_exp = self.A_log.float().exp()
             self._cached_A_exp = a_exp
-        decay = self.kda_lower_bound * torch.sigmoid(
-            a_exp * decay.view(1, -1, self.local_num_heads, self.head_dim))
-        beta = beta.float().sigmoid()
+        decay = decay.view(1, -1, self.local_num_heads, self.head_dim).mul_(a_exp).sigmoid_().mul_(self.kda_lower_bound)
+        beta = beta.float().sigmoid_()
         conv, recurrent = self.kv_cache
         cache_key = ("glm_kda_meta", self.cache_group_idx)
         context = get_forward_context()
@@ -260,7 +259,11 @@ class HpuKda(kda.Glm5NextLinearAttention):
             conv_weights_float = weights.float().unsqueeze(1)
             self._cached_conv_weights_float = conv_weights_float
             self._cached_conv_weights_2d = weights.float()
+            self._cached_conv_weights_hist = self._cached_conv_weights_2d[:, :-1]
+            self._cached_conv_weights_curr = self._cached_conv_weights_2d[:, -1]
         conv_weights_2d = self._cached_conv_weights_2d
+        conv_weights_hist = self._cached_conv_weights_hist
+        conv_weights_curr = self._cached_conv_weights_curr
         core = None if (x.shape[0] == 1 and batch == 1) else torch.zeros(
             (x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         for row, (source, target, length, has_state) in enumerate(zip(load_ids, store_ids, lengths, initial)):
@@ -273,11 +276,11 @@ class HpuKda(kda.Glm5NextLinearAttention):
             history = history[:, -(self.conv_size - 1):].float()
             if not has_state:
                 history = torch.zeros_like(history)
-            stream = torch.cat([history, qkv[start:end].float().T], dim=1)
             if length == 1:
-                conv_out = (stream * conv_weights_2d).sum(dim=-1, keepdim=True).T
+                conv_out = (history * conv_weights_hist).sum(dim=-1, keepdim=True).T.addcmul_(qkv[start:end].float(), conv_weights_curr)
                 filtered = F.silu(conv_out).to(x.dtype)
             else:
+                stream = torch.cat([history, qkv[start:end].float().T], dim=1)
                 filtered = F.conv1d(stream.unsqueeze(0), conv_weights_float, groups=stream.shape[0])
                 filtered = F.silu(filtered.squeeze(0).T).to(x.dtype)
             q, k, v = [
@@ -297,14 +300,22 @@ class HpuKda(kda.Glm5NextLinearAttention):
             else:
                 core[start:end] = output[0]
             recurrent[target].copy_(final[0])
-            tail = stream[:, -(self.conv_size - 1):].to(conv.dtype)
-            if self._conv_state_dim_first:
-                conv[target, :, -tail.shape[1]:].copy_(tail)
+            if length == 1:
+                if self._conv_state_dim_first:
+                    conv[target, :, -(self.conv_size - 1):-1].copy_(history[:, -(self.conv_size - 2):].to(conv.dtype))
+                    conv[target, :, -1:].copy_(qkv[start:end].to(conv.dtype).T)
+                else:
+                    conv[target, -(self.conv_size - 1):-1].copy_(history[:, -(self.conv_size - 2):].to(conv.dtype).T)
+                    conv[target, -1:].copy_(qkv[start:end].to(conv.dtype))
             else:
-                conv[target, -tail.shape[1]:].copy_(tail.T)
+                tail = stream[:, -(self.conv_size - 1):].to(conv.dtype)
+                if self._conv_state_dim_first:
+                    conv[target, :, -tail.shape[1]:].copy_(tail)
+                else:
+                    conv[target, -tail.shape[1]:].copy_(tail.T)
         if core is None:
             core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
-        gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid()
+        gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid_()
         core_f = core.float()
         normed = core_f.mul_(torch.rsqrt(core_f.square().mean(-1, keepdim=True) + self.o_norm.eps))
         o_norm_weight = getattr(self, "_cached_o_norm_weight_float", None)
