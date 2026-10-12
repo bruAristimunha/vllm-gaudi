@@ -167,7 +167,7 @@ class HpuIndexer(attention.Indexer):
                 result[:, :ids.numel()] = ids[None, :]
             else:
                 take = min(self.topk_tokens // 4, count)
-                scores = torch.matmul(q.float(), cached_pools.T).relu()
+                scores = torch.matmul(q.float(), cached_pools.T).relu_()
                 scores = (scores * weights[:, :, None]).sum(1)
                 ranked, selected_p = scores.topk(take, dim=-1)
                 offsets = getattr(self, "_cached_offsets_4", None)
@@ -283,10 +283,7 @@ class HpuKda(kda.Glm5NextLinearAttention):
                 stream = torch.cat([history, qkv[start:end].float().T], dim=1)
                 filtered = F.conv1d(stream.unsqueeze(0), conv_weights_float, groups=stream.shape[0])
                 filtered = F.silu(filtered.squeeze(0).T).to(x.dtype)
-            q, k, v = [
-                t.view(1, int(length), self.local_num_heads, self.head_dim)
-                for t in filtered.split(self.local_projection_size, dim=-1)
-            ]
+            q, k, v = filtered.view(1, int(length), 3, self.local_num_heads, self.head_dim).unbind(dim=2)
             state = recurrent[source:source + 1] if has_state else torch.zeros_like(recurrent[source:source + 1])
             output, final = hpu_chunk_kda(q,
                                           k,

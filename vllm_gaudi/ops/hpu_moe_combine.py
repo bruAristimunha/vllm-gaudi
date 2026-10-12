@@ -145,7 +145,7 @@ def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swi
     if swiglu_limit is not None:
         gate = gate.clamp(max=swiglu_limit)
         up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-    activations = (gate * torch.sigmoid(gate)).mul_(up)  # silu(gate)*up, [G,T,I] f32
+    activations = torch.sigmoid(gate).mul_(gate).mul_(up)  # silu(gate)*up, [G,T,I] f32
 
     # DOWN projection: act has a wide dynamic range (silu output), so it CANNOT
     # be fp8-quantized without losing ~2-6% precision (fp8 has only 3 mantissa
