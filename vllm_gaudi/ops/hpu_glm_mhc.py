@@ -80,7 +80,7 @@ def hpu_mhc_pre(
     x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
     mixes = torch.matmul(x, fn_t)
     sqrsum = x.square().sum(dim=-1, keepdim=True)
-    mixes = mixes.mul_(torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps))
+    mixes = mixes.mul_(torch.rsqrt(sqrsum.div_(hc_mult * hidden_size).add_(rms_eps)))
 
     base_pre = getattr(hc_base, "_cached_pre", None)
     if base_pre is None or base_pre.shape[0] != hc_mult:

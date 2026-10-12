@@ -321,7 +321,7 @@ class HpuKda(kda.Glm5NextLinearAttention):
             core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid_()
         core_f = core.float()
-        normed = core_f.mul_(torch.rsqrt(core_f.square().mean(-1, keepdim=True) + self.o_norm.eps))
+        normed = core_f.mul_(torch.rsqrt(core_f.square().mean(-1, keepdim=True).add_(self.o_norm.eps)))
         o_norm_weight = getattr(self, "_cached_o_norm_weight_float", None)
         if o_norm_weight is None:
             o_norm_weight = self.o_norm.weight.float()
@@ -368,7 +368,7 @@ class HpuDecoderLayer(model.Glm5NextDecoderLayer):
                 except Exception:
                     pass
             value = layer_input.float()
-            value = value.mul_(torch.rsqrt(value.square().mean(-1, keepdim=True) + norm_eps))
+            value = value.mul_(torch.rsqrt(value.square().mean(-1, keepdim=True).add_(norm_eps)))
             layer_input = value.mul_(float_weight).to(layer_input.dtype)
         return post, comb, layer_input
 
