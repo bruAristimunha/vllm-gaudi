@@ -189,7 +189,7 @@ class HpuIndexer(attention.Indexer):
                 tail_slice.copy_(self._cached_offsets_3).add_(count * 4)
                 tail_slice.masked_fill_(tail_slice > pos, -1)
             selected = cached_physical[result.clamp_min(0)].masked_fill_(result < 0, -1)
-            out[:1, :selected.shape[1]] = selected.to(out.dtype)
+            out[:1, :selected.shape[1]].copy_(selected)
             return out
 
         block_list = _cpu_metadata("block_list").tolist()
@@ -278,15 +278,11 @@ class HpuKda(kda.Glm5NextLinearAttention):
             if source < 0 or target < 0 or length == 0:
                 continue
             start, end = row * stride, row * stride + int(length)
-            history = conv[source]
-            if not self._conv_state_dim_first:
-                history = history.T
-            history = history[:, -(self.conv_size - 1):].float()
-            if not has_state:
-                history = torch.zeros_like(history)
+            history_orig = conv[source] if self._conv_state_dim_first else conv[source].T
+            history = history_orig[:, -(self.conv_size - 1):].float() if has_state else torch.zeros_like(history_orig[:, -(self.conv_size - 1):].float())
             if length == 1:
                 conv_out = (history * conv_weights_hist).sum(dim=-1, keepdim=True).T.addcmul_(qkv[start:end].float(), conv_weights_curr)
-                filtered = F.silu(conv_out).to(x.dtype)
+                filtered = F.silu(conv_out, inplace=True).to(x.dtype)
             else:
                 stream = torch.cat([history, qkv[start:end].float().T], dim=1)
                 filtered = F.conv1d(stream.unsqueeze(0), conv_weights_float, groups=stream.shape[0])
@@ -306,12 +302,13 @@ class HpuKda(kda.Glm5NextLinearAttention):
                 core[start:end] = output[0]
             recurrent[target].copy_(final[0])
             if length == 1:
+                history_tail = history_orig[:, -(self.conv_size - 2):] if has_state else history[:, -(self.conv_size - 2):].to(conv.dtype)
                 if self._conv_state_dim_first:
-                    conv[target, :, -(self.conv_size - 1):-1].copy_(history[:, -(self.conv_size - 2):].to(conv.dtype))
-                    conv[target, :, -1:].copy_(qkv[start:end].to(conv.dtype).T)
+                    conv[target, :, -(self.conv_size - 1):-1].copy_(history_tail)
+                    conv[target, :, -1:].copy_(qkv[start:end].T)
                 else:
-                    conv[target, -(self.conv_size - 1):-1].copy_(history[:, -(self.conv_size - 2):].to(conv.dtype).T)
-                    conv[target, -1:].copy_(qkv[start:end].to(conv.dtype))
+                    conv[target, -(self.conv_size - 1):-1].copy_(history_tail.T)
+                    conv[target, -1:].copy_(qkv[start:end])
             else:
                 tail = stream[:, -(self.conv_size - 1):].to(conv.dtype)
                 if self._conv_state_dim_first:
