@@ -102,14 +102,14 @@ def hpu_mhc_pre(
         base_comb = hc_base._cached_comb
         s0, s1, s2 = hc_scale._cached_s0, hc_scale._cached_s1, hc_scale._cached_s2
 
-    pre_logits = mixes[:, :hc_mult] * s0 + base_pre
-    pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+    pre_logits = (mixes[:, :hc_mult] * s0).add_(base_pre)
+    pre_mix = torch.sigmoid(pre_logits).add_(hc_pre_eps)
 
-    post_logits = mixes[:, hc_mult:2 * hc_mult] * s1 + base_post
-    post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
+    post_logits = (mixes[:, hc_mult:2 * hc_mult] * s1).add_(base_post)
+    post_mix = torch.sigmoid(post_logits).mul_(hc_post_mult_value)
 
-    comb_logits = mixes[:, 2 * hc_mult:].view(num_tokens, hc_mult, hc_mult) * s2 + base_comb
-    comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
+    comb_logits = (mixes[:, 2 * hc_mult:].view(num_tokens, hc_mult, hc_mult) * s2).add_(base_comb)
+    comb_mix = torch.softmax(comb_logits, dim=-1).add_(hc_sinkhorn_eps)
     comb_mix = _sinkhorn(comp=comb_mix, eps=hc_sinkhorn_eps, iterations=sinkhorn_repeat)
 
     layer_input = torch.sum(pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1).to(torch.bfloat16)
