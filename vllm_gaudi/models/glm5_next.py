@@ -49,12 +49,12 @@ class HpuIndexer(attention.Indexer):
         if not hasattr(self, "_cached_k_norm_weight_float"):
             self._cached_k_norm_weight_float = self.k_norm.weight.float()
             self._cached_k_norm_bias_float = self.k_norm.bias.float() if self.k_norm.bias is not None else None
-            self._cached_wk_weights_float_t = self.wk_weights_proj.weight[128:].float().T
-            self._cached_scale_factor = self.softmax_scale * (self.n_head**-0.5)
+            scale_factor = self.softmax_scale * (self.n_head**-0.5)
+            self._cached_wk_weights_float_t = self.wk_weights_proj.weight[128:].float().T * scale_factor
         keys = F.layer_norm(kw[:, :128].float(), (128, ), self._cached_k_norm_weight_float,
                             self._cached_k_norm_bias_float, self.k_norm.eps).to(x.dtype)
         weights = x.float() @ self._cached_wk_weights_float_t
-        weights = weights.mul_(scale.view(-1, self.n_head)).mul_(self._cached_scale_factor)
+        weights = weights.mul_(scale.view(-1, self.n_head))
         gate_t = getattr(self, "_cached_compress_gate_t", None)
         if gate_t is None:
             gate_t = self.index_kpool_compress_gate.t()
