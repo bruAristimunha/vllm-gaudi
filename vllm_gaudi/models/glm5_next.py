@@ -55,7 +55,11 @@ class HpuIndexer(attention.Indexer):
                             self._cached_k_norm_bias_float, self.k_norm.eps).to(x.dtype)
         weights = x.float() @ self._cached_wk_weights_float_t
         weights = weights.mul_(scale.view(-1, self.n_head)).mul_(self._cached_scale_factor)
-        gates = F.linear(x, self.index_kpool_compress_gate)
+        gate_t = getattr(self, "_cached_compress_gate_t", None)
+        if gate_t is None:
+            gate_t = self.index_kpool_compress_gate.t()
+            self._cached_compress_gate_t = gate_t
+        gates = x @ gate_t
         cache = self.k_cache.kv_cache
         if isinstance(cache, (tuple, list)):
             cache = cache[0]
@@ -140,8 +144,8 @@ class HpuIndexer(attention.Indexer):
                 new_slots = cached_physical[(count - 1) * 4 : count * 4]
                 raw_new = cache.index_select(0, new_slots)
                 k_new = raw_new[:, :128].view(1, 4, 128).float()
-                g_new = raw_new[:, 128:256].view(1, 4, 128).float() + self._cached_compress_ape_float
-                p_new = (g_new.softmax(dim=1) * k_new).sum(1).to(torch.bfloat16)
+                g_new = raw_new[:, 128:256].view(1, 4, 128).float().add_(self._cached_compress_ape_float)
+                p_new = (g_new.softmax(dim=1).mul_(k_new)).sum(1).to(torch.bfloat16)
                 v_new, s_new = fwht128_quant_values(p_new.contiguous())
                 new_pool = v_new.float().mul_(s_new)
                 buf_p = getattr(self, "_cached_pools_buf", None)
@@ -163,8 +167,11 @@ class HpuIndexer(attention.Indexer):
             else:
                 result.fill_(-1)
             if total_tokens <= self.topk_tokens:
-                ids = torch.arange(total_tokens, device=x.device)
-                result[:, :ids.numel()] = ids[None, :]
+                arange_buf = getattr(self, "_cached_arange_topk", None)
+                if arange_buf is None:
+                    arange_buf = torch.arange(self.topk_tokens + 1, device=x.device)
+                    self._cached_arange_topk = arange_buf
+                result[:, :total_tokens] = arange_buf[:total_tokens]
             else:
                 take = min(self.topk_tokens // 4, count)
                 scores = torch.matmul(q.float(), cached_pools.T).relu_()
@@ -180,7 +187,7 @@ class HpuIndexer(attention.Indexer):
                 result[:, :take * 4] = tokens
                 tail_2d = count * 4 + self._cached_offsets_3
                 result[:, self.topk_tokens:] = tail_2d.masked_fill_(tail_2d > pos, -1)
-            selected = cached_physical[result.clamp_min(0)].masked_fill(result < 0, -1)
+            selected = cached_physical[result.clamp_min(0)].masked_fill_(result < 0, -1)
             out[:1, :selected.shape[1]] = selected.to(out.dtype)
             return out
 
