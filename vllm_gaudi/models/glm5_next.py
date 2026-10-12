@@ -298,7 +298,7 @@ class HpuKda(kda.Glm5NextLinearAttention):
                                           decay[:, start:end],
                                           beta[start:end].unsqueeze(0),
                                           initial_state=state,
-                                          chunk_size=64)
+                                          chunk_size=128)
             if core is None:
                 core = output[0]
             else:

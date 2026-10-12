@@ -175,8 +175,8 @@ def _hpu_kda_single_decode_step_norm(
     beta_step: torch.Tensor,
     state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_q = torch.rsqrt((q_step * q_step).sum(-1, keepdim=True) + 1e-6)
-    q_norm = q_step * (inv_q * (q_step.shape[-1]**-0.5))
+    inv_q = torch.rsqrt((q_step * q_step).sum(-1, keepdim=True) + 1e-6).mul_(0.08838834764831845)
+    q_norm = q_step * inv_q
     inv_k = torch.rsqrt((k_step * k_step).sum(-1, keepdim=True) + 1e-6)
     k_norm = k_step * inv_k
     state = state * g_step.exp().unsqueeze(-1)
