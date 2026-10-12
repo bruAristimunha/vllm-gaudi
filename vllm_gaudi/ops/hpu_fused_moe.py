@@ -513,7 +513,9 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
         activation = _normalize_moe_activation(layer.activation)
-        if activation == _SWIGLU_OAI_ACTIVATION:
+        if activation == "silu" and getattr(layer, "swiglu_limit", None) is not None:
+            output = _swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=1., beta=0., limit=layer.swiglu_limit)
+        elif activation == _SWIGLU_OAI_ACTIVATION:
             # Habana fused MoE lacks SwiGLU-OAI; compute the experts unfused
             # (dense), or gather-only routed experts at low-conc decode.
             output = _swigluoai_moe(
@@ -606,7 +608,9 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             return gpt_oss_out.view(*input_shape)
 
         activation = _normalize_moe_activation(layer.activation)
-        if activation == _SWIGLU_OAI_ACTIVATION:
+        if activation == "silu" and getattr(layer, "swiglu_limit", None) is not None:
+            output = _swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=1., beta=0., limit=layer.swiglu_limit)
+        elif activation == _SWIGLU_OAI_ACTIVATION:
             # Habana fused MoE lacks SwiGLU-OAI; compute the experts unfused
             # (dense), or gather-only routed experts at low-conc decode.
             output = _swigluoai_moe(

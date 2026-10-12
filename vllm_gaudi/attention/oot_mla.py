@@ -142,7 +142,8 @@ class HPUMLAAttention(MLAAttention):
     ) -> torch.Tensor:
         is_prefill = attn_metadata.is_prompt
 
-        if not is_prefill:
+        pooled_prefill = is_prefill and getattr(self, 'hpu_pooled_sparse_prefill', False)
+        if not is_prefill or pooled_prefill:
             # decode
             q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             # Convert from (B, N, P) to (N, B, P)
@@ -162,6 +163,13 @@ class HPUMLAAttention(MLAAttention):
             # Always use impl-owned cache op so INC quantization maps to one canonical module path.
             self.impl.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
 
+        if pooled_prefill:
+            query = torch.cat((decode_ql_nope, q_pe), dim=-1)
+            parts = []
+            for start in range(0, query.shape[0], 8):
+                parts.append(self.impl.forward_mqa_sparse(query[start:start + 8], kv_cache, attn_metadata,
+                                                          self.impl.topk_indices_buffer[start:start + 8]))
+            return self._v_up_proj(torch.cat(parts))
         if is_prefill:
             output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)
             return output

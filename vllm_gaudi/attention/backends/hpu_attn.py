@@ -291,7 +291,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         # =========================== #
 
         k_c_normed, k_pe = latent_vec_k.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        k_pe = k_pe.unsqueeze(1)
 
         kv_nope = self.kv_b_proj(k_c_normed)[0]\
             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)

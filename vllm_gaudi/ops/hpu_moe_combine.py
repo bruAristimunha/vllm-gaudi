@@ -46,6 +46,7 @@ def gather_silu_fp8_moe(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Compute the rank-local FP8 silu MoE partial for routed experts only.
 
@@ -53,6 +54,24 @@ def gather_silu_fp8_moe(
     Mirrors the Habana op's data flow: fp8-quantize x, per-token weighted sum
     over the routed experts, each expert computed as silu(w13 x) w2.
     """
+    # shortcut: bounded token slices cap temporary weights; tune after model parity.
+    if swiglu_limit is not None and x.shape[0] > 32:
+        return torch.cat([
+            gather_silu_fp8_moe(layer, x[i:i + 32], topk_ids[i:i + 32], topk_weights[i:i + 32], swiglu_limit)
+            for i in range(0, x.shape[0], 32)
+        ])
+    # Quantization stays eager: compiling across its FP8 boundary changes values.
+    x_fp8, x_scale = _dynamic_quant(x)
+    compute = _compiled_gather if swiglu_limit is not None else _gather_from_quantized
+    return compute(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit)
+
+
+@torch.compile(backend="hpu_backend", fullgraph=True, dynamic=False)
+def _compiled_gather(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit):
+    return _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit)
+
+
+def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swiglu_limit):
     tokens, hidden_size = x.shape
     num_topk = topk_ids.shape[-1]
     w13 = layer.w13_weight  # [E, 2I, H] fp8
@@ -62,11 +81,9 @@ def gather_silu_fp8_moe(
     local_experts = w13.shape[0]
     intermediate_size = w13.shape[1] // 2
 
-    # ---- FP8-quantize x per token (match the op's input quantization) ----
     # x_scale is kept as [T,1] (NOT squeezed): fp8_gemm_v2 requires the row
     # scale in 2-D form; squeezing only works at T=1 and silently mis-scales at
     # larger T.
-    x_fp8, x_scale = _dynamic_quant(x)  # x_fp8 [T,H], x_scale [T,1] f32
 
     # ---- per-token expert combine weights (scatter over E) ----
     # topk_ids are GLOBAL expert ids; remap to this rank's local ids and mask
@@ -76,8 +93,8 @@ def gather_silu_fp8_moe(
     experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
     local_ids = topk_ids - experts_min  # [T,K]
     in_range = (local_ids >= 0) & (local_ids < local_experts)
-    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
-    safe_weights = torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).float()
+    safe_ids = torch.where(in_range, local_ids, 0)
+    safe_weights = torch.where(in_range, topk_weights.float(), 0.0)
     gate_weights = x.new_zeros(tokens, local_experts, dtype=torch.float32)
     gate_weights.scatter_add_(1, safe_ids, safe_weights)  # [T,E] f32
 
@@ -88,7 +105,7 @@ def gather_silu_fp8_moe(
     # static (no torch.nonzero, no `if G == 0`) lets this capture cleanly into a
     # compiled HPU graph (mirrors _gather_swigluoai_moe).
     gathered_experts = min(local_experts, tokens * num_topk)
-    hit_counts = (gate_weights != 0).float().sum(0)  # [E]
+    hit_counts = (gate_weights[0] != 0).float() if tokens == 1 else (gate_weights != 0).float().sum(0)
     gather_ids = torch.topk(hit_counts, gathered_experts, sorted=False).indices  # [G]
     gather_ids, _ = torch.sort(gather_ids)  # ascending ids
 
@@ -123,9 +140,15 @@ def gather_silu_fp8_moe(
         bias=None,
         accumulate=False,
     )  # [T, G*2I] f32
-    projected = projected.reshape(tokens, gathered_experts, 2 * intermediate_size).permute(1, 0, 2)  # [G, T, 2I] f32
+    if tokens == 1:
+        projected = projected.view(gathered_experts, 1, 2 * intermediate_size)
+    else:
+        projected = projected.reshape(tokens, gathered_experts, 2 * intermediate_size).permute(1, 0, 2)  # [G, T, 2I] f32
     gate, up = projected[..., :intermediate_size], projected[..., intermediate_size:]
-    activations = gate * torch.sigmoid(gate) * up  # silu(gate)*up, [G,T,I] f32
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    activations = torch.sigmoid(gate).mul_(gate).mul_(up)  # silu(gate)*up, [G,T,I] f32
 
     # DOWN projection: act has a wide dynamic range (silu output), so it CANNOT
     # be fp8-quantized without losing ~2-6% precision (fp8 has only 3 mantissa
@@ -134,10 +157,10 @@ def gather_silu_fp8_moe(
     # activations. So the down projection dequantizes w2 to fp32 and runs a plain
     # fp32 bmm (same as the baseline); only the UP/GATE projection runs in native
     # fp8.
-    w2_float = w2_gathered.float() * scale2_gathered.unsqueeze(-1)  # [G, H, I] f32
+    w2_float = w2_gathered.float().mul_(scale2_gathered.unsqueeze(-1))  # [G, H, I] f32
     expert_outputs = torch.bmm(activations, w2_float.transpose(1, 2))  # [G, T, H] f32
 
     # ---- weighted sum over experts -> [T, H] ----
     gathered_weights = gate_weights.index_select(1, gather_ids).t()  # [G, T]
-    out = (expert_outputs * gathered_weights.unsqueeze(-1)).sum(0)  # [T, H] f32
+    out = expert_outputs.mul_(gathered_weights.unsqueeze(-1)).sum(0)  # [T, H] f32
     return out.to(x.dtype)
