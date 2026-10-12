@@ -176,7 +176,7 @@ def _hpu_kda_single_decode_step_norm(
     state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inv_q = torch.rsqrt((q_step * q_step).sum(-1, keepdim=True) + 1e-6)
-    q_norm = (q_step * inv_q) * (q_step.shape[-1]**-0.5)
+    q_norm = q_step * (inv_q * (q_step.shape[-1]**-0.5))
     inv_k = torch.rsqrt((k_step * k_step).sum(-1, keepdim=True) + 1e-6)
     k_norm = k_step * inv_k
     state = state * g_step.exp().unsqueeze(-1)
@@ -213,7 +213,8 @@ def hpu_chunk_kda(
 
     if T == 1:
         # One decode token needs only the recurrence, not a triangular chunk solve.
-        state = initial_state.float() if initial_state is not None else q.new_zeros(S, H, D, Vdim, dtype=torch.float32)
+        state = initial_state if (initial_state is not None and initial_state.dtype == torch.float32) else (
+            initial_state.float() if initial_state is not None else q.new_zeros(S, H, D, Vdim, dtype=torch.float32))
         q_step = q[:, 0].float()
         k_step = k[:, 0].float()
         v_step = v[:, 0].float()

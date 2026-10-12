@@ -140,7 +140,10 @@ def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swi
         bias=None,
         accumulate=False,
     )  # [T, G*2I] f32
-    projected = projected.reshape(tokens, gathered_experts, 2 * intermediate_size).permute(1, 0, 2)  # [G, T, 2I] f32
+    if tokens == 1:
+        projected = projected.view(gathered_experts, 1, 2 * intermediate_size)
+    else:
+        projected = projected.reshape(tokens, gathered_experts, 2 * intermediate_size).permute(1, 0, 2)  # [G, T, 2I] f32
     gate, up = projected[..., :intermediate_size], projected[..., intermediate_size:]
     if swiglu_limit is not None:
         gate = gate.clamp(max=swiglu_limit)
