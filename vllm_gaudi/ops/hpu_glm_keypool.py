@@ -27,10 +27,10 @@ def fwht128_quant_values(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # Keep the BF16 roundtrip eager so compilation cannot remove its rounding.
     x = (x * 0.08838834764831845).to(torch.bfloat16).float()
     scale = torch.exp2(torch.ceil(torch.log2(x.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448)))
-    y = (x / scale).clamp(-448, 448)
+    y = (x / scale).clamp_(-448, 448)
     # Gaudi2's native FP8 cast overflows above 240; BF16 represents every FN value.
     step = torch.exp2(torch.floor(torch.log2(y.abs().clamp_min(2**-6))) - 3)
-    values = (torch.round(y / step) * step).to(torch.bfloat16)
+    values = torch.round(y / step).mul_(step).to(torch.bfloat16)
     return values, scale
 
 

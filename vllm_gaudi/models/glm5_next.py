@@ -110,7 +110,7 @@ class HpuIndexer(attention.Indexer):
                         logits = raw[:count * 4, 128:256].view(count, 4, 128).float() + self._cached_compress_ape_float
                         pooled = (logits.softmax(dim=1) * pooled_keys).sum(1).to(torch.bfloat16)
                         values, scales = fwht128_quant_values(pooled.contiguous())
-                        cached_pools = values.float() * scales
+                        cached_pools = values.float().mul_(scales)
                     else:
                         cached_pools = torch.empty(0, 128, device=x.device, dtype=torch.float32)
                     buf_p = torch.empty((max(count + 512, 512), 128), dtype=torch.float32, device=x.device)
@@ -143,7 +143,7 @@ class HpuIndexer(attention.Indexer):
                 g_new = raw_new[:, 128:256].view(1, 4, 128).float() + self._cached_compress_ape_float
                 p_new = (g_new.softmax(dim=1) * k_new).sum(1).to(torch.bfloat16)
                 v_new, s_new = fwht128_quant_values(p_new.contiguous())
-                new_pool = v_new.float() * s_new
+                new_pool = v_new.float().mul_(s_new)
                 buf_p = getattr(self, "_cached_pools_buf", None)
                 if buf_p is None or buf_p.shape[0] < count:
                     new_cap = max(count + 256, count * 2 if count > 0 else 256)

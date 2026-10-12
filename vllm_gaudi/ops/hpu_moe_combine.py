@@ -93,8 +93,8 @@ def _gather_from_quantized(layer, x, topk_ids, topk_weights, x_fp8, x_scale, swi
     experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
     local_ids = topk_ids - experts_min  # [T,K]
     in_range = (local_ids >= 0) & (local_ids < local_experts)
-    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
-    safe_weights = torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).float()
+    safe_ids = torch.where(in_range, local_ids, 0)
+    safe_weights = torch.where(in_range, topk_weights.float(), 0.0)
     gate_weights = x.new_zeros(tokens, local_experts, dtype=torch.float32)
     gate_weights.scatter_add_(1, safe_ids, safe_weights)  # [T,E] f32
 
