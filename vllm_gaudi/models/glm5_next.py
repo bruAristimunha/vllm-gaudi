@@ -54,7 +54,7 @@ class HpuIndexer(attention.Indexer):
         keys = F.layer_norm(kw[:, :128].float(), (128, ), self._cached_k_norm_weight_float,
                             self._cached_k_norm_bias_float, self.k_norm.eps).to(x.dtype)
         weights = x.float() @ self._cached_wk_weights_float_t
-        weights = weights * scale.view(-1, self.n_head) * self._cached_scale_factor
+        weights = weights.mul_(scale.view(-1, self.n_head)).mul_(self._cached_scale_factor)
         gates = F.linear(x, self.index_kpool_compress_gate)
         cache = self.k_cache.kv_cache
         if isinstance(cache, (tuple, list)):
@@ -64,7 +64,16 @@ class HpuIndexer(attention.Indexer):
         if meta is None or cache is None or cache.numel() == 0:
             return out
         slots = meta.slot_mapping.reshape(-1)
-        cache.index_copy_(0, slots, F.pad(torch.cat([keys, gates], dim=-1), (0, cache.shape[-1] - 256)))
+        if x.shape[0] == 1:
+            buf_insert = getattr(self, "_cached_insert_buf", None)
+            if buf_insert is None or buf_insert.shape[-1] != cache.shape[-1]:
+                buf_insert = torch.zeros((1, cache.shape[-1]), dtype=keys.dtype, device=keys.device)
+                self._cached_insert_buf = buf_insert
+            buf_insert[0, :128].copy_(keys[0])
+            buf_insert[0, 128:256].copy_(gates[0])
+            cache.index_copy_(0, slots, buf_insert)
+        else:
+            cache.index_copy_(0, slots, F.pad(torch.cat([keys, gates], dim=-1), (0, cache.shape[-1] - 256)))
         positions = positions.reshape(-1)
         # Only scheduling metadata crosses to the host; model values stay on HPU.
         if meta.is_prompt:
@@ -297,7 +306,7 @@ class HpuKda(kda.Glm5NextLinearAttention):
             core = torch.zeros((x.shape[0], self.local_num_heads, self.head_dim), device=x.device, dtype=x.dtype)
         gate = self.g_b_proj(ga)[0].view_as(core).float().sigmoid()
         core_f = core.float()
-        normed = core_f * torch.rsqrt(core_f.square().mean(-1, keepdim=True) + self.o_norm.eps)
+        normed = core_f.mul_(torch.rsqrt(core_f.square().mean(-1, keepdim=True) + self.o_norm.eps))
         o_norm_weight = getattr(self, "_cached_o_norm_weight_float", None)
         if o_norm_weight is None:
             o_norm_weight = self.o_norm.weight.float()
