@@ -104,6 +104,16 @@ _KDA_SCAN_PARALLEL = os.environ.get("VLLM_KDA_SCAN", "seq").strip().lower() \
 # the worst case; smaller ones only add matmul calls.
 _DECAY_BLOCK = 16
 _DECAY_EXP_MAX = 5.0 * _DECAY_BLOCK
+_CACHED_EYE: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _get_cached_eye(n: int, device: torch.device) -> torch.Tensor:
+    key = (n, device)
+    eye = _CACHED_EYE.get(key)
+    if eye is None:
+        eye = torch.eye(n, dtype=torch.float32, device=device)
+        _CACHED_EYE[key] = eye
+    return eye
 
 
 def _decay_dot(
@@ -263,7 +273,7 @@ def hpu_chunk_kda(
     b_h = b_c.permute(0, 1, 3, 2).reshape(SC * H, tc)
     v_h = v_c.permute(0, 1, 3, 2, 4).reshape(SC * H, tc, Vdim)
 
-    eye_tc = torch.eye(tc, dtype=torch.float32, device=device)
+    eye_tc = _get_cached_eye(tc, device)
 
     # ---- Phase A: T = (I + strict_lower(b_i * decay-dot))^{-1} -------------
     dot = _decay_dot(k_h, k_h, gs_h, gs_h)  # [SCH, tc, tc]
@@ -276,7 +286,7 @@ def hpu_chunk_kda(
     # unit-diagonal form as GDN (no self-retention term).
     br = b_h.unsqueeze(-1)
     rhs_u = v_h * br  # v_j * b_j
-    rhs_w = k_h * br * gs_h.exp()  # k_j * b_j * e^{gsum_j} (<=1, safe)
+    rhs_w = (k_h * br).mul_(gs_h.exp())  # k_j * b_j * e^{gsum_j} (<=1, safe)
     u = torch.bmm(t_inv, rhs_u)  # [SCH, tc, V]
     w = torch.bmm(t_inv, rhs_w)  # [SCH, tc, D]
 
@@ -306,11 +316,12 @@ def hpu_chunk_kda(
     # -- delta rides the OUTER k factor, so it scales BOTH u and w in the
     # contraction. Fold it once into kk = k * delta.
     kk = k_all * delta  # [S,C,H,tc,D]
+    kk_t = kk.transpose(-1, -2)
 
-    n_t = torch.matmul(kk.transpose(-1, -2), u_h5)  # [S,C,H,D,V]
-    r = torch.matmul(kk.transpose(-1, -2), w_h5)  # [S,C,H,D,D]
+    n_t = torch.matmul(kk_t, u_h5)  # [S,C,H,D,V]
+    r = torch.matmul(kk_t, w_h5)  # [S,C,H,D,D]
     alpha = gs_last.exp().squeeze(-2)  # [S,C,H,D]
-    eye_d = torch.eye(D, dtype=torch.float32, device=device)
+    eye_d = _get_cached_eye(D, device)
     m_full = alpha.unsqueeze(-1) * eye_d - r  # [S,C,H,D,D]
 
     x0 = (torch.zeros(S, H, D, Vdim, dtype=torch.float32, device=device)

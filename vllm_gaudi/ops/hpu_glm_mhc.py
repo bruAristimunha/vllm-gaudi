@@ -127,6 +127,6 @@ def hpu_mhc_post(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     mixed = torch.matmul(comb_res_mix.transpose(-2, -1), residual.float())
-    return mixed.addcmul_(post_layer_mix, x.unsqueeze(-2).float()).to(residual.dtype)
+    return mixed.addcmul_(post_layer_mix, x.float().unsqueeze(-2)).to(residual.dtype)
 
 
