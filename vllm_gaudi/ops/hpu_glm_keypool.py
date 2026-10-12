@@ -50,9 +50,9 @@ def select_pooled_tokens(q, weights, keys, gates, ape, positions, topk):
         return result
     pooled_keys = keys[:count * pool_size].view(count, pool_size, dim).float()
     logits = gates[:count * pool_size].view(count, pool_size, dim).float() + ape.float()
-    pooled = (logits.softmax(dim=1) * pooled_keys).sum(1).to(torch.bfloat16)
+    pooled = (logits.softmax(dim=1).mul_(pooled_keys)).sum(1).to(torch.bfloat16)
     values, scales = fwht128_quant_values(pooled.contiguous())
-    pooled = values.float() * scales
+    pooled = values.float().mul_(scales)
     take = min(topk // pool_size, count)
     pool_ids = torch.arange(count, device=q.device)
     offsets = torch.arange(pool_size, device=q.device)
@@ -60,8 +60,11 @@ def select_pooled_tokens(q, weights, keys, gates, ape, positions, topk):
     for start in range(0, rows, 32):
         end = min(rows, start + 32)
         n = end - start
-        scores = torch.matmul(q[start:end].float(), pooled.T).relu()
-        scores = (scores * weights[start:end, :, None]).sum(1)
+        scores = torch.matmul(q[start:end].float(), pooled.T).relu_()
+        if scores.shape[1] == weights.shape[1]:
+            scores = torch.matmul(weights[start:end].unsqueeze(1), scores).squeeze(1)
+        else:
+            scores = (scores * weights[start:end, :, None]).sum(1)
         completed = (positions[start:end] + 1) // pool_size
         scores.masked_fill_(pool_ids[None, :] >= completed[:, None], -torch.inf)
         ranked, selected = scores.topk(take, dim=-1)

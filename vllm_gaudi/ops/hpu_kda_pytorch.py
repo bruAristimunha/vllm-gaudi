@@ -237,11 +237,12 @@ def hpu_chunk_kda(
     g = g.float()
     beta = beta.float()
     if use_qk_l2norm_in_kernel:
-        inv = torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+        inv = torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6).mul_(D**-0.5)
         q = q * inv
         inv = torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
         k = k * inv
-    q = q * (D**-0.5)
+    else:
+        q = q * (D**-0.5)
 
     # pad to chunk multiple (g padded with zeros: no decay in padding, so the
     # per-chunk cumsum stays constant after the last real token)

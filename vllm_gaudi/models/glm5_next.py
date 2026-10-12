@@ -175,7 +175,10 @@ class HpuIndexer(attention.Indexer):
             else:
                 take = min(self.topk_tokens // 4, count)
                 scores = torch.matmul(q.float(), cached_pools.T).relu_()
-                scores = (scores * weights[:, :, None]).sum(1)
+                if scores.shape[1] == weights.shape[1]:
+                    scores = torch.matmul(weights.unsqueeze(1), scores).squeeze(1)
+                else:
+                    scores = (scores * weights[:, :, None]).sum(1)
                 ranked, selected_p = scores.topk(take, dim=-1)
                 offsets = getattr(self, "_cached_offsets_4", None)
                 if offsets is None:
