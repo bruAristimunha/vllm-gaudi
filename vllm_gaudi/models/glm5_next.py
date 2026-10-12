@@ -171,7 +171,7 @@ class HpuIndexer(attention.Indexer):
                 if arange_buf is None:
                     arange_buf = torch.arange(self.topk_tokens + 1, device=x.device)
                     self._cached_arange_topk = arange_buf
-                result[:, :total_tokens] = arange_buf[:total_tokens]
+                result[:, :total_tokens].copy_(arange_buf[:total_tokens])
             else:
                 take = min(self.topk_tokens // 4, count)
                 scores = torch.matmul(q.float(), cached_pools.T).relu_()
