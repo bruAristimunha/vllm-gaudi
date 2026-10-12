@@ -182,9 +182,9 @@ class HpuIndexer(attention.Indexer):
                     offsets = torch.arange(4, device=x.device)
                     self._cached_offsets_4 = offsets
                     self._cached_offsets_3 = torch.arange(3, device=x.device).unsqueeze(0)
-                out_tokens = result[:, :take * 4]
-                out_tokens.copy_((selected_p[:, :, None] * 4 + offsets).reshape(1, -1))
-                out_tokens.masked_fill_(ranked.isneginf().repeat_interleave(4, dim=1), -1)
+                out_tokens_view = result[:, :take * 4].view(1, take, 4)
+                out_tokens_view.copy_(selected_p.unsqueeze(-1)).mul_(4).add_(offsets)
+                out_tokens_view.masked_fill_(ranked.isneginf().unsqueeze(-1), -1)
                 tail_slice = result[:, self.topk_tokens:]
                 tail_slice.copy_(self._cached_offsets_3).add_(count * 4)
                 tail_slice.masked_fill_(tail_slice > pos, -1)
